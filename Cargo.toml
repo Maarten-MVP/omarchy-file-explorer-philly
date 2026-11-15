@@ -1,0 +1,26 @@
+[package]
+name = "philly"
+version = "0.1.0"
+edition = "2021"
+description = "A fast, keyboard-first file explorer with a git panel for Omarchy"
+license = "MIT"
+
+[dependencies]
+gtk = { package = "gtk4", version = "0.11", features = ["v4_20"] }
+adw = { package = "libadwaita", version = "0.9", features = ["v1_8"] }
+sourceview5 = "0.11"
+poppler-rs = "0.26"
+git2 = { version = "0.21", default-features = false }
+pulldown-cmark = { version = "0.13", default-features = false }
+nucleo-matcher = "0.3"
+ignore = "0.4"
+similar = { version = "2.7", features = ["inline"] }
+gio = { version = "0.22", features = ["v2_80"] }
+serde_json = "1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 4
+strip = true
+panic = "abort"

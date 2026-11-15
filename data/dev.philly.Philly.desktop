@@ -1,0 +1,14 @@
+[Desktop Entry]
+Type=Application
+Name=Philly
+GenericName=File Explorer
+Comment=Fast, keyboard-first file explorer with source control
+Exec=philly %U
+Icon=system-file-manager
+Terminal=false
+StartupNotify=true
+StartupWMClass=dev.philly.Philly
+Categories=System;FileTools;FileManager;Utility;GTK;
+MimeType=inode/directory;
+Keywords=files;folder;explorer;git;
+DBusActivatable=false
