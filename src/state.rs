@@ -11,11 +11,13 @@ pub struct State {
     pub split: bool,
     pub show_hidden: bool,
     pub last_picker_dir: Option<PathBuf>,
+    /// UI zoom factor (Ctrl +/−), 1.0 = system size.
+    pub zoom: f64,
 }
 
 impl Default for State {
     fn default() -> Self {
-        State { width: 1280, height: 820, side: 380, split: false, show_hidden: true, last_picker_dir: None }
+        State { width: 1280, height: 820, side: 380, split: false, show_hidden: true, last_picker_dir: None, zoom: 1.0 }
     }
 }
 
@@ -34,6 +36,7 @@ pub fn load() -> State {
             "side" => s.side = v.parse().unwrap_or(s.side),
             "split" => s.split = v == "true",
             "show_hidden" => s.show_hidden = v == "true",
+            "zoom" => s.zoom = v.parse().unwrap_or(s.zoom),
             "last_picker_dir" if !v.is_empty() => s.last_picker_dir = Some(PathBuf::from(v)),
             _ => {}
         }
@@ -45,12 +48,13 @@ pub fn save(s: &State) {
     let f = file();
     let _ = std::fs::create_dir_all(f.parent().unwrap());
     let text = format!(
-        "width={}\nheight={}\nside={}\nsplit={}\nshow_hidden={}\nlast_picker_dir={}\n",
+        "width={}\nheight={}\nside={}\nsplit={}\nshow_hidden={}\nzoom={}\nlast_picker_dir={}\n",
         s.width,
         s.height,
         s.side,
         s.split,
         s.show_hidden,
+        s.zoom,
         s.last_picker_dir.as_ref().map(|p| p.to_string_lossy().to_string()).unwrap_or_default()
     );
     let _ = std::fs::write(f, text);

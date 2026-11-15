@@ -72,7 +72,7 @@ fn main() -> glib::ExitCode {
         .build();
 
     app.connect_startup(|app| {
-        theme::init();
+        theme::init(state::load().zoom);
         if std::env::var_os("PHILLY_NO_DBUS").is_none() {
             portal::register(app);
         }

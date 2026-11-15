@@ -72,11 +72,13 @@ pub fn human(n: u64) -> String {
     human_size(n)
 }
 
-fn keycap_row(keys: &str, desc: &str) -> gtk::Box {
+/// `column` keeps the key column of all rows as wide as the widest one, at any zoom.
+fn keycap_row(keys: &str, desc: &str, column: &gtk::SizeGroup) -> gtk::Box {
     let b = gtk::Box::new(gtk::Orientation::Horizontal, 10);
     b.set_halign(gtk::Align::Center);
     let k = gtk::Box::new(gtk::Orientation::Horizontal, 4);
     k.set_size_request(150, -1);
+    column.add_widget(&k);
     k.set_halign(gtk::Align::End);
     for part in keys.split(' ') {
         let l = gtk::Label::new(Some(part));
@@ -177,6 +179,7 @@ impl Preview {
         big.add_css_class("big");
         big.set_margin_bottom(16);
         empty.append(&big);
+        let key_column = gtk::SizeGroup::new(gtk::SizeGroupMode::Horizontal);
         for (k, d) in [
             ("Ctrl P", "Go to file"),
             ("Ctrl L", "Type a path"),
@@ -184,7 +187,7 @@ impl Preview {
             ("Ctrl Shift G", "Source control"),
             ("Ctrl /", "All shortcuts"),
         ] {
-            empty.append(&keycap_row(k, d));
+            empty.append(&keycap_row(k, d, &key_column));
         }
 
         let stack = gtk::Stack::new();
@@ -294,7 +297,10 @@ impl Preview {
     }
 
     pub fn reload(&self) {
-        match self.shown.borrow().clone() {
+        // Clone out first: a borrow held across the match would still be alive
+        // when show_file_inner() replaces `shown`.
+        let shown = self.shown.borrow().clone();
+        match shown {
             Shown::Nothing => {}
             Shown::File(p) => self.show_file_inner(&p, true),
             Shown::Diff(root, ch) => self.show_diff(&root, &ch),

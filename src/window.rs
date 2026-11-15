@@ -130,6 +130,7 @@ pub struct Win {
     status_branch: gtk::Label,
     status_sel: gtk::Label,
     shortcuts: gtk::Revealer,
+    zoom_toast: RefCell<Option<adw::Toast>>,
     back: RefCell<Vec<PathBuf>>,
     forward: RefCell<Vec<PathBuf>>,
     current: RefCell<PathBuf>,
@@ -394,6 +395,7 @@ impl Win {
             status_branch,
             status_sel,
             shortcuts,
+            zoom_toast: RefCell::new(None),
             back: RefCell::new(Vec::new()),
             forward: RefCell::new(Vec::new()),
             current: RefCell::new(PathBuf::new()),
@@ -642,6 +644,12 @@ impl Win {
             if let Some(w) = w.upgrade() {
                 w.tree.restyle();
                 w.on_git_status();
+            }
+        });
+        let w = self.weak();
+        crate::theme::on_zoom(move || {
+            if let Some(w) = w.upgrade() {
+                w.tree.restyle();
             }
         });
     }
@@ -1224,6 +1232,24 @@ impl Win {
         self.preview.widget.set_visible(v);
     }
 
+    /// Zoom the UI one step in (1) or out (-1), or back to 100% (0).
+    fn zoom(&self, step: i32) {
+        let old = crate::theme::zoom();
+        let z = crate::theme::set_zoom(if step == 0 { 1.0 } else { old + step as f64 * 0.1 });
+        if z != old {
+            let mut st = state::load();
+            st.zoom = z;
+            state::save(&st);
+        }
+        if let Some(t) = self.zoom_toast.take() {
+            t.dismiss();
+        }
+        let t = adw::Toast::new(&format!("Zoom {:.0}%", z * 100.0));
+        t.set_timeout(1);
+        self.toasts.add_toast(t.clone());
+        self.zoom_toast.replace(Some(t));
+    }
+
     fn toggle_shortcuts(&self) {
         let open = !self.shortcuts.reveals_child();
         if open {
@@ -1659,14 +1685,25 @@ impl Win {
         let sc = gtk::EventControllerKey::new();
         sc.set_propagation_phase(gtk::PropagationPhase::Capture);
         let w = self.weak();
-        sc.connect_key_pressed(move |_, key, _, state| {
+        sc.connect_key_pressed(move |c, key, code, state| {
             let Some(w) = w.upgrade() else { return glib::Propagation::Proceed };
             let mask = gdk::ModifierType::CONTROL_MASK | gdk::ModifierType::SHIFT_MASK | gdk::ModifierType::ALT_MASK | gdk::ModifierType::SUPER_MASK;
             let (key, mods) = (key.to_lower(), state & mask);
             let table = table.borrow();
-            match table.iter().find(|(k, m, _)| *k == key && *m == mods) {
-                Some((_, _, f)) if f(&w) => glib::Propagation::Stop,
-                _ => glib::Propagation::Proceed,
+            let handled = match table.iter().find(|(k, m, _)| *k == key && *m == mods) {
+                Some((_, _, f)) => f(&w),
+                None => match zoom_step(c, key, code, mods) {
+                    Some(step) => {
+                        w.zoom(step);
+                        true
+                    }
+                    None => false,
+                },
+            };
+            if handled {
+                glib::Propagation::Stop
+            } else {
+                glib::Propagation::Proceed
             }
         });
         self.window.add_controller(sc);
@@ -1872,6 +1909,34 @@ impl Win {
     }
 }
 
+/// Ctrl with the "+", "-" or "0" key: zoom in (1), out (-1) or reset (0).
+///
+/// Where those characters sit differs per layout ("+" is shifted on most, "0"
+/// is shifted on AZERTY), so go by what the pressed key carries on its first
+/// two levels, not by the keyval alone: Ctrl+= zooms in wherever "+" shares
+/// that key, and Ctrl+0 resets without Shift on AZERTY.
+fn zoom_step(c: &gtk::EventControllerKey, key: gdk::Key, code: u32, mods: gdk::ModifierType) -> Option<i32> {
+    if mods & !gdk::ModifierType::SHIFT_MASK != gdk::ModifierType::CONTROL_MASK {
+        return None;
+    }
+    let event = c.current_event().and_then(|e| e.downcast::<gdk::KeyEvent>().ok());
+    let layout = event.as_ref().map(|e| e.layout());
+    let mut vals = vec![key];
+    if let Some(entries) = event.and_then(|e| e.display()).and_then(|d| d.map_keycode(code)) {
+        vals.extend(entries.into_iter().filter(|(k, _)| k.level() <= 1 && layout.map_or(true, |l| k.group() as u32 == l)).map(|(_, v)| v));
+    }
+    let has = |keys: &[gdk::Key]| vals.iter().any(|v| keys.contains(v));
+    if has(&[gdk::Key::plus, gdk::Key::KP_Add]) {
+        Some(1)
+    } else if has(&[gdk::Key::minus, gdk::Key::KP_Subtract]) {
+        Some(-1)
+    } else if has(&[gdk::Key::_0, gdk::Key::KP_0]) {
+        Some(0)
+    } else {
+        None
+    }
+}
+
 fn focus_in_text(window: &adw::ApplicationWindow) -> bool {
     let Some(f) = gtk::prelude::GtkWindowExt::focus(window) else { return false };
     f.is::<gtk::Text>() || f.is::<gtk::TextView>() || f.ancestor(gtk::Entry::static_type()).is_some() || f.ancestor(gtk::SearchEntry::static_type()).is_some()
@@ -1911,6 +1976,8 @@ fn shortcuts_sheet() -> gtk::Widget {
                 ("Ctrl \\", "Diff side by side"),
                 ("Ctrl Shift V", "Markdown source"),
                 ("Ctrl H", "Hidden files"),
+                ("Ctrl + −", "Zoom in / out"),
+                ("Ctrl 0", "Reset zoom"),
             ],
         ),
         (
@@ -1944,6 +2011,8 @@ fn shortcuts_sheet() -> gtk::Widget {
     let grid = gtk::Box::new(gtk::Orientation::Horizontal, 28);
     for (title, items) in groups {
         let col = gtk::Box::new(gtk::Orientation::Vertical, 6);
+        // Keeps the descriptions aligned however wide the keycaps get (zoom).
+        let key_column = gtk::SizeGroup::new(gtk::SizeGroupMode::Horizontal);
         let t = gtk::Label::builder().label(*title).xalign(0.0).build();
         t.add_css_class("group");
         col.append(&t);
@@ -1951,6 +2020,7 @@ fn shortcuts_sheet() -> gtk::Widget {
             let row = gtk::Box::new(gtk::Orientation::Horizontal, 10);
             let keys = gtk::Box::new(gtk::Orientation::Horizontal, 3);
             keys.set_size_request(130, -1);
+            key_column.add_widget(&keys);
             for part in k.split(' ') {
                 let l = gtk::Label::new(Some(part));
                 l.add_css_class("keycap");

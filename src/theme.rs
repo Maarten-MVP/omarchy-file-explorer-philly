@@ -3,7 +3,7 @@
 //! user switches theme.
 
 use gtk::{gdk, gio, glib, prelude::*};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
@@ -76,6 +76,103 @@ thread_local! {
     static PALETTE: RefCell<Option<Palette>> = const { RefCell::new(None) };
     static LISTENERS: RefCell<Vec<Box<dyn Fn()>>> = const { RefCell::new(Vec::new()) };
     static MONITORS: RefCell<Vec<gio::FileMonitor>> = const { RefCell::new(Vec::new()) };
+    static ZOOM_LISTENERS: RefCell<Vec<Box<dyn Fn()>>> = const { RefCell::new(Vec::new()) };
+    static ZOOM: Cell<f64> = const { Cell::new(1.0) };
+    /// gtk-xft-dpi as the system set it, before any zoom.
+    static BASE_DPI: Cell<i32> = const { Cell::new(0) };
+}
+
+pub const ZOOM_MIN: f64 = 0.6;
+pub const ZOOM_MAX: f64 = 2.5;
+
+fn clamp_zoom(z: f64) -> f64 {
+    if !z.is_finite() {
+        return 1.0;
+    }
+    ((z * 10.0).round() / 10.0).clamp(ZOOM_MIN, ZOOM_MAX)
+}
+
+/// Current UI zoom factor (1.0 = system size). Shared by every window.
+pub fn zoom() -> f64 {
+    ZOOM.with(|z| z.get())
+}
+
+/// Scale the whole UI: text through the font DPI, and the pixel sizes in our
+/// own stylesheet (icons, row heights, paddings) to match. Returns the zoom
+/// actually applied.
+pub fn set_zoom(z: f64) -> f64 {
+    let z = clamp_zoom(z);
+    if (z - zoom()).abs() > 1e-6 {
+        ZOOM.with(|c| c.set(z));
+        apply_dpi();
+        let css = build_css(&palette());
+        PROVIDER.with(|p| {
+            if let Some(prov) = p.borrow().as_ref() {
+                prov.load_from_string(&css);
+            }
+        });
+        ZOOM_LISTENERS.with(|l| l.borrow().iter().for_each(|f| f()));
+    }
+    z
+}
+
+/// Register a callback that runs after the zoom changed (for pixel sizes set
+/// from code; the stylesheet and text follow by themselves).
+pub fn on_zoom(f: impl Fn() + 'static) {
+    ZOOM_LISTENERS.with(|l| l.borrow_mut().push(Box::new(f)));
+}
+
+/// A pixel size from code, scaled like the stylesheet's.
+pub fn px(v: i32) -> i32 {
+    (v as f64 * zoom()).round() as i32
+}
+
+fn apply_dpi() {
+    let Some(settings) = gtk::Settings::default() else { return };
+    let base = BASE_DPI.with(|b| {
+        if b.get() == 0 {
+            let v = settings.gtk_xft_dpi();
+            b.set(if v > 0 { v } else { 96 * 1024 });
+        }
+        b.get()
+    });
+    settings.set_gtk_xft_dpi((base as f64 * zoom()).round() as i32);
+}
+
+/// Multiply every `<n>px` length in the stylesheet by `z`.
+fn scale_px(css: &str, z: f64) -> String {
+    if (z - 1.0).abs() < 1e-6 {
+        return css.to_string();
+    }
+    let b = css.as_bytes();
+    let mut out = String::with_capacity(css.len() + 256);
+    let (mut i, mut copied) = (0, 0);
+    while i < b.len() {
+        if b[i] == b'#' {
+            // Hex colour: not a length, whatever digits it holds.
+            i += 1;
+            while i < b.len() && b[i].is_ascii_alphanumeric() {
+                i += 1;
+            }
+        } else if b[i].is_ascii_digit() && (i == 0 || !(b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'.' || b[i - 1] == b'_')) {
+            let start = i;
+            while i < b.len() && (b[i].is_ascii_digit() || b[i] == b'.') {
+                i += 1;
+            }
+            let is_px = css[i..].starts_with("px") && !b.get(i + 2).map(|c| c.is_ascii_alphanumeric()).unwrap_or(false);
+            if let (true, Ok(v)) = (is_px, css[start..i].parse::<f64>()) {
+                // Whole pixels, and a hairline never scales away.
+                let scaled = if v == 0.0 { 0.0 } else { (v * z).round().max(1.0) };
+                out.push_str(&css[copied..start]);
+                out.push_str(&format!("{scaled}"));
+                copied = i;
+            }
+        } else {
+            i += 1;
+        }
+    }
+    out.push_str(&css[copied..]);
+    out
 }
 
 pub fn palette() -> Palette {
@@ -87,7 +184,12 @@ pub fn on_change(f: impl Fn() + 'static) {
     LISTENERS.with(|l| l.borrow_mut().push(Box::new(f)));
 }
 
-pub fn init() {
+pub fn init(zoom: f64) {
+    let zoom = clamp_zoom(zoom);
+    if zoom != 1.0 {
+        ZOOM.with(|z| z.set(zoom));
+        apply_dpi();
+    }
     apply();
     // Omarchy swaps the theme by rewriting theme.name and the theme dir.
     let state = glib::home_dir().join(".local/state/omarchy/current");
@@ -173,7 +275,7 @@ fn build_css(p: &Palette) -> String {
     let magenta = g("magenta");
     let cyan = g("cyan");
     let orange = g("orange");
-    format!(
+    let css = format!(
         r#"
 :root {{
   --window-bg-color: {bg};
@@ -381,6 +483,8 @@ textview.markdown, textview.markdown text {{ background: {bg}; color: {fg}; }}
 .picker-bar button {{ min-height: 32px; border-radius: 6px; }}
 
 /* ---------- misc ---------- */
+/* The stock symbolic icon size, stated here so it follows the zoom. */
+image {{ -gtk-icon-size: 16px; }}
 popover.menu contents, popover contents {{ border-radius: 8px; }}
 .shortcuts-sheet {{ background: {lighter}; border-radius: 12px; border: 1px solid {muted}; padding: 18px 22px; box-shadow: 0 10px 40px alpha(black, 0.55); }}
 .shortcuts-sheet .group {{ color: {accent}; font-weight: 700; font-size: 0.8em; letter-spacing: 0.08em; margin-top: 10px; }}
@@ -391,7 +495,24 @@ scrollbar slider:hover {{ background: alpha({fg}, 0.4); }}
 .dim {{ color: {dim}; }}
 .orange {{ color: {orange}; }}
 "#
-    )
+    );
+    scale_px(&css, zoom())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::scale_px;
+
+    #[test]
+    fn scales_px_lengths_only() {
+        let css = ".a { color: #14px0; min-height: 24px; margin: 0 -2px 1px 0.5em; font-size: 0.85em; border: 1px solid #1a1b26; }";
+        assert_eq!(scale_px(css, 1.0), css);
+        assert_eq!(
+            scale_px(css, 1.5),
+            ".a { color: #14px0; min-height: 36px; margin: 0 -3px 2px 0.5em; font-size: 0.85em; border: 2px solid #1a1b26; }"
+        );
+        assert_eq!(scale_px("x { min-width: 1px; padding: 0px 3px; }", 0.6), "x { min-width: 1px; padding: 0px 2px; }");
+    }
 }
 
 /// GtkSourceView style scheme generated from the palette, so code previews

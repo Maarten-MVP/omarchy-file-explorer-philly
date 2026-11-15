@@ -366,7 +366,7 @@ impl Tree {
             let row = gtk::Box::new(gtk::Orientation::Horizontal, 0);
             row.add_css_class("tree-row");
             row.add_css_class("sticky-row");
-            row.set_margin_start(4 + depth as i32 * 14);
+            row.set_margin_start(crate::theme::px(4) + depth as i32 * crate::theme::px(14));
             let chevron = gtk::Image::from_icon_name("pan-down-symbolic");
             chevron.add_css_class("sticky-chevron");
             let icon = gtk::Label::new(None);
@@ -744,8 +744,12 @@ impl Tree {
         }
     }
 
+    /// After a theme or zoom change: rows and the sticky header carry colours
+    /// and pixel sizes set from code.
     pub fn restyle(&self) {
         self.restyle_rows();
+        self.sticky_paths.borrow_mut().clear();
+        self.update_sticky();
     }
 
     fn setup_factory(self: &Rc<Self>) {
