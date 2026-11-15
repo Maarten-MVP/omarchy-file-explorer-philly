@@ -28,7 +28,6 @@ pub struct GitPanel {
     commit_btn: gtk::Button,
     list: gtk::ListBox,
     rows: RefCell<Vec<Change>>,
-    sync_label: gtk::Label,
     pull_btn: gtk::Button,
     push_btn: gtk::Button,
     fetch_btn: gtk::Button,
@@ -102,8 +101,6 @@ impl GitPanel {
         let scroll = gtk::ScrolledWindow::builder().child(&list).vexpand(true).hscrollbar_policy(gtk::PolicyType::Never).build();
 
         // Push / pull state and buttons.
-        let sync_label = gtk::Label::builder().xalign(0.0).wrap(true).wrap_mode(gtk::pango::WrapMode::WordChar).build();
-        sync_label.add_css_class("sync-label");
         let pull_btn = gtk::Button::builder().css_classes(["sync-btn"]).tooltip_text("Pull (fast-forward only)").hexpand(true).build();
         let push_btn = gtk::Button::builder().css_classes(["sync-btn"]).hexpand(true).build();
         let sync_btns = gtk::Box::new(gtk::Orientation::Horizontal, 6);
@@ -157,7 +154,6 @@ impl GitPanel {
 
         let repo_view = gtk::Box::new(gtk::Orientation::Vertical, 0);
         repo_view.append(&branch);
-        repo_view.append(&sync_label);
         repo_view.append(&sync_btns);
         repo_view.append(&commit_box);
         repo_view.append(&commit_btn);
@@ -191,7 +187,6 @@ impl GitPanel {
             commit_btn,
             list,
             rows: RefCell::new(Vec::new()),
-            sync_label,
             pull_btn,
             push_btn,
             fetch_btn,
@@ -488,11 +483,15 @@ impl GitPanel {
                     Some(t) => format!("fetched {}", rel_time(t)),
                     None => "never fetched".into(),
                 };
-                format!("{push} · {pull}\n{fetched}")
+                format!("{push} · {pull} · {fetched}")
             }
         };
-        self.sync_label.set_text(&text);
-        self.sync_label.set_tooltip_text(st.upstream.as_ref().map(|u| format!("Compared with {u} as of the last fetch")).as_deref());
+        // The counts are on the buttons; the rest goes in the tooltips.
+        self.pull_btn.set_tooltip_text(Some(&format!("Pull (fast-forward only)\n{text}")));
+        self.fetch_btn.set_tooltip_text(Some(&match st.fetched {
+            Some(t) => format!("Fetch from the remote (last fetch {})", rel_time(t)),
+            None => "Fetch from the remote (never fetched)".into(),
+        }));
         let busy = self.busy.get();
         self.pull_btn.set_label(&format!("↓  Pull{}", if st.behind > 0 { format!(" {}", st.behind) } else { String::new() }));
         self.pull_btn.set_sensitive(!busy && st.upstream.is_some() && st.behind > 0);
@@ -501,7 +500,7 @@ impl GitPanel {
             self.push_btn.set_tooltip_text(Some("Push this branch and track it (git push -u)"));
         } else {
             self.push_btn.set_label(&format!("↑  Push{}", if st.ahead > 0 { format!(" {}", st.ahead) } else { String::new() }));
-            self.push_btn.set_tooltip_text(Some("Push"));
+            self.push_btn.set_tooltip_text(Some(&format!("Push\n{text}")));
         }
         self.push_btn.set_sensitive(!busy && (st.upstream.is_none() || st.ahead > 0));
         self.pull_btn.set_css_classes(if st.behind > 0 { &["sync-btn", "pending"] } else { &["sync-btn"] });
@@ -515,7 +514,7 @@ impl GitPanel {
         if self.busy.replace(true) {
             return;
         }
-        self.sync_label.set_text(doing);
+        self.pull_btn.set_label(doing);
         for b in [&self.pull_btn, &self.push_btn, &self.fetch_btn] {
             b.set_sensitive(false);
         }

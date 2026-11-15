@@ -1370,6 +1370,12 @@ impl Win {
                 w.toast(&e);
             }
         }));
+        add("terminal-root", Box::new(|w| {
+            let d = if w.tree.is_trash() { glib::home_dir() } else { w.tree.root() };
+            if let Err(e) = fileops::open_terminal(&d) {
+                w.toast(&e);
+            }
+        }));
         add("new-file", Box::new(|w| w.new_item(false)));
         add("new-folder", Box::new(|w| w.new_item(true)));
         add("cut", Box::new(|w| {
@@ -1609,6 +1615,15 @@ impl Win {
         }));
         add("<Control><Shift>c", Box::new(|w| {
             gio::prelude::ActionGroupExt::activate_action(&w.window, "terminal", None);
+            true
+        }));
+        // Works everywhere, also while typing in the path bar.
+        add("<Control><Shift>Return", Box::new(|w| {
+            gio::prelude::ActionGroupExt::activate_action(&w.window, "terminal-root", None);
+            true
+        }));
+        add("<Control><Shift>KP_Enter", Box::new(|w| {
+            gio::prelude::ActionGroupExt::activate_action(&w.window, "terminal-root", None);
             true
         }));
         add("<Control>grave", Box::new(|w| {
@@ -1919,6 +1934,7 @@ fn shortcuts_sheet() -> gtk::Widget {
                 ("Shift Alt C", "Copy path"),
                 ("Ctrl Shift Alt C", "Copy relative path"),
                 ("Ctrl Shift C", "Terminal here"),
+                ("Ctrl Shift ⏎", "Terminal in this folder"),
                 ("Ctrl Alt N", "New window"),
                 ("F5", "Refresh"),
                 ("Ctrl W", "Close window"),

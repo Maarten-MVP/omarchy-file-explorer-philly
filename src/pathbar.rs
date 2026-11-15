@@ -189,6 +189,17 @@ impl PathBar {
         frame.add_css_class("pathbar");
         frame.set_hexpand(true);
         frame.append(&places_btn);
+        // Terminal in the folder shown (the tree's root).
+        let term = gtk::Button::builder()
+            .css_classes(["flat", "crumb"])
+            .tooltip_text("Open this folder in a terminal (Ctrl+Shift+Enter)")
+            .action_name("win.terminal-root")
+            .build();
+        let tl = gtk::Label::new(None);
+        tl.set_markup(&format!("<span foreground=\"{}\">\u{f120}</span>", crate::theme::color("accent")));
+        tl.add_css_class("file-icon");
+        term.set_child(Some(&tl));
+        frame.append(&term);
         frame.append(&stack);
         frame.append(&pin);
 

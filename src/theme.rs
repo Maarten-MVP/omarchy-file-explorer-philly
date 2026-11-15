@@ -314,7 +314,6 @@ treeexpander expander {{ min-width: 16px; color: {dim}; -gtk-icon-size: 12px; }}
 .navigation-sidebar.git-list > row {{ min-height: 22px; padding: 0; margin: 0 4px; border-radius: 4px; }}
 .navigation-sidebar.git-list {{ padding: 2px 0; }}
 .git-list .tree-row button {{ min-width: 20px; min-height: 20px; padding: 0; margin: 0; }}
-.sync-label {{ color: {dim}; font-size: 0.85em; padding: 0 14px 6px 14px; }}
 .sync-btns {{ margin: 0 12px 4px 12px; }}
 .sync-btn {{ min-height: 26px; padding: 0 8px; border-radius: 6px; font-size: 0.9em; }}
 .sync-btn.pending {{ color: {accent}; box-shadow: inset 0 0 0 1px {accent}; }}
