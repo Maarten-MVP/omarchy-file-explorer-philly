@@ -1,9 +1,9 @@
 //! Source control panel: changed files, stage / unstage / discard, commit.
 
-use crate::git::{self, Change, Status};
+use crate::git::{self, Change, Commit, Flow, Status};
 use crate::icons;
 use gtk::{gdk, glib, prelude::*};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
 use std::rc::{Rc, Weak};
 
@@ -14,6 +14,8 @@ pub struct Callbacks {
     pub toast: Option<Box<dyn Fn(String)>>,
     pub changed: Option<Box<dyn Fn()>>,
     pub confirm: Option<Box<dyn Fn(String, String, Box<dyn Fn()>)>>,
+    /// A commit was picked in the commit list.
+    pub show_commit: Option<Box<dyn Fn(PathBuf, Commit)>>,
 }
 
 pub struct GitPanel {
@@ -26,6 +28,17 @@ pub struct GitPanel {
     commit_btn: gtk::Button,
     list: gtk::ListBox,
     rows: RefCell<Vec<Change>>,
+    sync_label: gtk::Label,
+    pull_btn: gtk::Button,
+    push_btn: gtk::Button,
+    fetch_btn: gtk::Button,
+    /// A fetch / pull / push is running.
+    busy: Cell<bool>,
+    commits: gtk::ListBox,
+    commit_rows: RefCell<Vec<Commit>>,
+    commits_count: gtk::Label,
+    /// (root, HEAD, upstream) the commit list was loaded for.
+    log_key: RefCell<String>,
     status: RefCell<Option<Rc<Status>>>,
     /// Latest status received while the panel was hidden; applied on map.
     pending: RefCell<Option<Option<Rc<Status>>>>,
@@ -58,7 +71,14 @@ impl GitPanel {
             .bottom_margin(2)
             .build();
         msg.set_size_request(-1, 54);
-        let placeholder = gtk::Label::builder().xalign(0.0).yalign(0.0).can_target(false).build();
+        let placeholder = gtk::Label::builder()
+            .xalign(0.0)
+            .yalign(0.0)
+            .can_target(false)
+            .wrap(true)
+            .wrap_mode(gtk::pango::WrapMode::WordChar)
+            .build();
+        placeholder.set_margin_top(2);
         placeholder.add_css_class("dim");
         let overlay = gtk::Overlay::new();
         overlay.set_child(Some(&msg));
@@ -77,14 +97,71 @@ impl GitPanel {
         let list = gtk::ListBox::new();
         list.set_selection_mode(gtk::SelectionMode::Single);
         list.add_css_class("navigation-sidebar");
+        list.add_css_class("git-list");
         list.set_activate_on_single_click(false);
         let scroll = gtk::ScrolledWindow::builder().child(&list).vexpand(true).hscrollbar_policy(gtk::PolicyType::Never).build();
 
+        // Push / pull state and buttons.
+        let sync_label = gtk::Label::builder().xalign(0.0).wrap(true).wrap_mode(gtk::pango::WrapMode::WordChar).build();
+        sync_label.add_css_class("sync-label");
+        let pull_btn = gtk::Button::builder().css_classes(["sync-btn"]).tooltip_text("Pull (fast-forward only)").hexpand(true).build();
+        let push_btn = gtk::Button::builder().css_classes(["sync-btn"]).hexpand(true).build();
+        let sync_btns = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        sync_btns.add_css_class("sync-btns");
+        sync_btns.set_homogeneous(true);
+        sync_btns.append(&pull_btn);
+        sync_btns.append(&push_btn);
+
+        // Recent commits, like VS Code's graph.
+        let commits_title = gtk::Label::builder().label("COMMITS").xalign(0.0).build();
+        let commits_count = gtk::Label::builder().xalign(0.0).hexpand(true).build();
+        commits_count.add_css_class("commits-count");
+        let fetch_btn = header_button("mail-send-receive-symbolic", "Fetch from the remote");
+        let commits_header = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        commits_header.add_css_class("section-header");
+        commits_header.add_css_class("commits-header");
+        commits_header.set_margin_start(10);
+        commits_header.append(&commits_title);
+        commits_header.append(&commits_count);
+        commits_header.append(&fetch_btn);
+        let commits = gtk::ListBox::new();
+        commits.set_selection_mode(gtk::SelectionMode::Single);
+        commits.add_css_class("navigation-sidebar");
+        commits.add_css_class("git-list");
+        commits.add_css_class("commit-list");
+        let commits_scroll = gtk::ScrolledWindow::builder().child(&commits).vexpand(true).hscrollbar_policy(gtk::PolicyType::Never).build();
+        let commits_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        commits_box.append(&commits_header);
+        commits_box.append(&commits_scroll);
+
+        let paned = gtk::Paned::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .start_child(&scroll)
+            .end_child(&commits_box)
+            .resize_start_child(true)
+            .resize_end_child(true)
+            .shrink_start_child(false)
+            .shrink_end_child(false)
+            .wide_handle(false)
+            .vexpand(true)
+            .build();
+        paned.add_css_class("git-paned");
+        // Start with the changes on top and the commits in the lower 40%.
+        let placed = Cell::new(false);
+        paned.connect_notify_local(Some("max-position"), move |p, _| {
+            if !placed.get() && p.max_position() > 200 {
+                placed.set(true);
+                p.set_position(p.max_position() * 55 / 100);
+            }
+        });
+
         let repo_view = gtk::Box::new(gtk::Orientation::Vertical, 0);
         repo_view.append(&branch);
+        repo_view.append(&sync_label);
+        repo_view.append(&sync_btns);
         repo_view.append(&commit_box);
         repo_view.append(&commit_btn);
-        repo_view.append(&scroll);
+        repo_view.append(&paned);
 
         let none = gtk::Label::builder()
             .label("This folder isn't inside a git repository.")
@@ -114,6 +191,15 @@ impl GitPanel {
             commit_btn,
             list,
             rows: RefCell::new(Vec::new()),
+            sync_label,
+            pull_btn,
+            push_btn,
+            fetch_btn,
+            busy: Cell::new(false),
+            commits,
+            commit_rows: RefCell::new(Vec::new()),
+            commits_count,
+            log_key: RefCell::new(String::new()),
             status: RefCell::new(None),
             pending: RefCell::new(None),
             cb: RefCell::new(Callbacks::default()),
@@ -125,6 +211,36 @@ impl GitPanel {
             if let Some(p) = w.upgrade() {
                 if let Some(st) = p.pending.borrow_mut().take() {
                     p.set_status(st);
+                }
+                p.auto_fetch();
+            }
+        });
+        let w = Rc::downgrade(&p);
+        p.fetch_btn.connect_clicked(move |_| {
+            if let Some(p) = w.upgrade() {
+                p.remote("Fetching…", "Fetched", git::fetch);
+            }
+        });
+        let w = Rc::downgrade(&p);
+        p.pull_btn.connect_clicked(move |_| {
+            if let Some(p) = w.upgrade() {
+                p.remote("Pulling…", "Pulled", git::pull);
+            }
+        });
+        let w = Rc::downgrade(&p);
+        p.push_btn.connect_clicked(move |_| {
+            if let Some(p) = w.upgrade() {
+                let publish = p.status.borrow().as_ref().map(|s| s.upstream.is_none()).unwrap_or(false);
+                p.remote(if publish { "Publishing…" } else { "Pushing…" }, if publish { "Published" } else { "Pushed" }, move |r| git::push(r, publish));
+            }
+        });
+        let w = Rc::downgrade(&p);
+        p.commits.connect_row_selected(move |_, row| {
+            let (Some(p), Some(row)) = (w.upgrade(), row) else { return };
+            let c = p.commit_rows.borrow().get(row.index() as usize).cloned();
+            if let (Some(c), Some(root)) = (c, p.root()) {
+                if let Some(f) = p.cb.borrow().show_commit.as_ref() {
+                    f(root, c);
                 }
             }
         });
@@ -282,14 +398,13 @@ impl GitPanel {
             return;
         };
         self.stack.set_visible_child_name("repo");
-        let mut b = format!("\u{e725}  {}", st.branch);
-        if st.ahead > 0 {
-            b.push_str(&format!("  ↑{}", st.ahead));
-        }
-        if st.behind > 0 {
-            b.push_str(&format!("  ↓{}", st.behind));
-        }
+        let b = match &st.upstream {
+            Some(up) => format!("\u{e725}  {}  →  {up}", st.branch),
+            None => format!("\u{e725}  {}", st.branch),
+        };
         self.branch.set_text(&b);
+        self.update_sync(&st);
+        self.load_log(&st);
         self.placeholder.set_text(&format!("Message (Ctrl+Enter to commit on \"{}\")", st.branch));
         let label = if st.staged.is_empty() && !st.unstaged.is_empty() { "\u{f00c}  Commit All" } else { "\u{f00c}  Commit" };
         if let Some(l) = self.commit_btn.child().and_downcast::<gtk::Label>() {
@@ -359,6 +474,132 @@ impl GitPanel {
                 }
             }
         }
+    }
+
+    /// The push / pull line and buttons.
+    fn update_sync(&self, st: &Status) {
+        let plural = |n: usize| if n == 1 { "commit" } else { "commits" };
+        let text = match &st.upstream {
+            None => "Not published: this branch has no upstream yet".to_string(),
+            Some(_) => {
+                let push = if st.ahead > 0 { format!("{} {} to push", st.ahead, plural(st.ahead)) } else { "Nothing to push".into() };
+                let pull = if st.behind > 0 { format!("{} to pull", st.behind) } else { "nothing to pull".into() };
+                let fetched = match st.fetched {
+                    Some(t) => format!("fetched {}", rel_time(t)),
+                    None => "never fetched".into(),
+                };
+                format!("{push} · {pull}\n{fetched}")
+            }
+        };
+        self.sync_label.set_text(&text);
+        self.sync_label.set_tooltip_text(st.upstream.as_ref().map(|u| format!("Compared with {u} as of the last fetch")).as_deref());
+        let busy = self.busy.get();
+        self.pull_btn.set_label(&format!("↓  Pull{}", if st.behind > 0 { format!(" {}", st.behind) } else { String::new() }));
+        self.pull_btn.set_sensitive(!busy && st.upstream.is_some() && st.behind > 0);
+        if st.upstream.is_none() {
+            self.push_btn.set_label("↑  Publish");
+            self.push_btn.set_tooltip_text(Some("Push this branch and track it (git push -u)"));
+        } else {
+            self.push_btn.set_label(&format!("↑  Push{}", if st.ahead > 0 { format!(" {}", st.ahead) } else { String::new() }));
+            self.push_btn.set_tooltip_text(Some("Push"));
+        }
+        self.push_btn.set_sensitive(!busy && (st.upstream.is_none() || st.ahead > 0));
+        self.pull_btn.set_css_classes(if st.behind > 0 { &["sync-btn", "pending"] } else { &["sync-btn"] });
+        self.push_btn.set_css_classes(if st.ahead > 0 || st.upstream.is_none() { &["sync-btn", "pending"] } else { &["sync-btn"] });
+        self.fetch_btn.set_sensitive(!busy && st.upstream.is_some());
+    }
+
+    /// Run a fetch / pull / push in the background, then refresh.
+    fn remote(&self, doing: &str, done: &'static str, f: impl FnOnce(&Path) -> Result<(), String> + Send + 'static) {
+        let Some(root) = self.root() else { return };
+        if self.busy.replace(true) {
+            return;
+        }
+        self.sync_label.set_text(doing);
+        for b in [&self.pull_btn, &self.push_btn, &self.fetch_btn] {
+            b.set_sensitive(false);
+        }
+        let w = self.me.borrow().clone();
+        glib::spawn_future_local(async move {
+            let res = gtk::gio::spawn_blocking(move || f(&root)).await.unwrap_or(Err("failed".into()));
+            let Some(p) = w.upgrade() else { return };
+            p.busy.set(false);
+            match res {
+                Ok(()) => p.toast(done),
+                Err(e) => p.toast(e),
+            }
+            // Restore the sync line now; the refresh updates it if anything moved.
+            if let Some(st) = p.status.borrow().clone() {
+                p.update_sync(&st);
+            }
+            p.notify_changed();
+        });
+    }
+
+    /// Fetch quietly when the panel opens and the last fetch is over 5 minutes old.
+    fn auto_fetch(&self) {
+        let Some(st) = self.status.borrow().clone() else { return };
+        if st.upstream.is_none() || self.busy.get() {
+            return;
+        }
+        let now = glib::real_time() / 1_000_000;
+        if st.fetched.map(|t| now - t < 300).unwrap_or(false) {
+            return;
+        }
+        let root = st.root.clone();
+        self.busy.set(true);
+        let w = self.me.borrow().clone();
+        glib::spawn_future_local(async move {
+            let res = gtk::gio::spawn_blocking(move || git::fetch(&root)).await;
+            let Some(p) = w.upgrade() else { return };
+            p.busy.set(false);
+            if let Some(st) = p.status.borrow().clone() {
+                p.update_sync(&st);
+            }
+            if matches!(res, Ok(Ok(()))) {
+                p.notify_changed();
+            }
+        });
+    }
+
+    /// Load the commit list when HEAD or the upstream moved.
+    fn load_log(&self, st: &Status) {
+        let key = format!("{}|{}|{}", st.root.display(), st.head_id, st.upstream_id);
+        if *self.log_key.borrow() == key {
+            return;
+        }
+        *self.log_key.borrow_mut() = key.clone();
+        let root = st.root.clone();
+        let w = self.me.borrow().clone();
+        glib::spawn_future_local(async move {
+            let commits = gtk::gio::spawn_blocking(move || git::log(&root, 200)).await.unwrap_or_default();
+            let Some(p) = w.upgrade() else { return };
+            if *p.log_key.borrow() != key {
+                return;
+            }
+            p.fill_commits(commits);
+        });
+    }
+
+    fn fill_commits(&self, commits: Vec<Commit>) {
+        while let Some(c) = self.commits.first_child() {
+            self.commits.remove(&c);
+        }
+        let n = commits.len();
+        for (i, c) in commits.iter().enumerate() {
+            self.commits.append(&commit_row(c, i == 0, i + 1 == n));
+        }
+        let out = commits.iter().filter(|c| c.flow == Flow::Outgoing).count();
+        let inc = commits.iter().filter(|c| c.flow == Flow::Incoming).count();
+        let mut count = String::new();
+        if out > 0 {
+            count.push_str(&format!("↑{out} "));
+        }
+        if inc > 0 {
+            count.push_str(&format!("↓{inc}"));
+        }
+        self.commits_count.set_text(count.trim());
+        *self.commit_rows.borrow_mut() = commits;
     }
 
     fn make_row(&self, ch: &Change) -> gtk::Box {
@@ -514,4 +755,98 @@ impl GitPanel {
             p.notify_changed();
         });
     }
+}
+
+
+/// "just now", "5 min ago", "3 h ago", "2 days ago", or the date.
+pub fn rel_time(t: i64) -> String {
+    let now = glib::real_time() / 1_000_000;
+    let d = (now - t).max(0);
+    match d {
+        0..=59 => "just now".into(),
+        60..=3599 => format!("{} min ago", d / 60),
+        3600..=86_399 => format!("{} h ago", d / 3600),
+        86_400..=604_799 => {
+            let n = d / 86_400;
+            format!("{n} {} ago", if n == 1 { "day" } else { "days" })
+        }
+        _ => glib::DateTime::from_unix_local(t).and_then(|dt| dt.format("%-d %b %Y")).map(|s| s.to_string()).unwrap_or_default(),
+    }
+}
+
+fn short_time(t: i64) -> String {
+    let now = glib::real_time() / 1_000_000;
+    let d = (now - t).max(0);
+    match d {
+        0..=59 => "now".into(),
+        60..=3599 => format!("{}m", d / 60),
+        3600..=86_399 => format!("{}h", d / 3600),
+        86_400..=2_591_999 => format!("{}d", d / 86_400),
+        _ => glib::DateTime::from_unix_local(t).and_then(|dt| dt.format("%-d %b")).map(|s| s.to_string()).unwrap_or_default(),
+    }
+}
+
+/// One commit: graph dot and line, subject, branch / tag badges, age.
+fn commit_row(c: &Commit, first: bool, last: bool) -> gtk::Box {
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    row.add_css_class("commit-row");
+    row.add_css_class(match c.flow {
+        Flow::Shared => "shared",
+        Flow::Outgoing => "outgoing",
+        Flow::Incoming => "incoming",
+    });
+    let graph = gtk::DrawingArea::new();
+    graph.add_css_class("commit-graph");
+    graph.set_content_width(14);
+    let (merge, flow, head) = (c.merge, c.flow, c.head);
+    graph.set_draw_func(move |a, cr, w, h| {
+        let col = a.color();
+        cr.set_source_rgba(col.red() as f64, col.green() as f64, col.blue() as f64, 0.55);
+        cr.set_line_width(2.0);
+        let x = w as f64 / 2.0;
+        let y = h as f64 / 2.0;
+        cr.move_to(x, if first { y } else { 0.0 });
+        cr.line_to(x, if last { y } else { h as f64 });
+        let _ = cr.stroke();
+        let r = if merge || head { 4.5 } else { 3.5 };
+        cr.set_source_rgba(col.red() as f64, col.green() as f64, col.blue() as f64, 1.0);
+        if flow == Flow::Shared && !head {
+            cr.arc(x, y, r, 0.0, std::f64::consts::TAU);
+            let _ = cr.fill();
+        } else {
+            // Not on both sides yet, or HEAD: a ring over the line.
+            cr.set_operator(gtk::cairo::Operator::Clear);
+            cr.arc(x, y, r, 0.0, std::f64::consts::TAU);
+            let _ = cr.fill();
+            cr.set_operator(gtk::cairo::Operator::Over);
+            cr.set_line_width(2.0);
+            cr.arc(x, y, r - 1.0, 0.0, std::f64::consts::TAU);
+            let _ = cr.stroke();
+        }
+    });
+    let summary = gtk::Label::builder().label(&c.summary).xalign(0.0).hexpand(true).ellipsize(gtk::pango::EllipsizeMode::End).build();
+    summary.add_css_class("commit-summary");
+    row.append(&graph);
+    row.append(&summary);
+    for r in c.refs.iter().take(2) {
+        let b = gtk::Label::new(Some(r));
+        b.add_css_class("ref-badge");
+        if r.contains('/') {
+            b.add_css_class("remote");
+        }
+        b.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        b.set_max_width_chars(14);
+        row.append(&b);
+    }
+    let age = gtk::Label::new(Some(&short_time(c.time)));
+    age.add_css_class("commit-age");
+    row.append(&age);
+    let state = match c.flow {
+        Flow::Outgoing => "\nNot pushed yet",
+        Flow::Incoming => "\nOn the remote, not pulled yet",
+        Flow::Shared => "",
+    };
+    let when = glib::DateTime::from_unix_local(c.time).and_then(|d| d.format("%-d %B %Y %H:%M")).map(|s| s.to_string()).unwrap_or_default();
+    row.set_tooltip_text(Some(&format!("{}\n\n{} · {} · {}{state}", c.message, &c.id[..7.min(c.id.len())], c.author, when)));
+    row
 }

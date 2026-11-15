@@ -66,6 +66,13 @@ pub struct Status {
     pub branch: String,
     pub ahead: usize,
     pub behind: usize,
+    /// Upstream branch, e.g. "origin/main" (None: not published).
+    pub upstream: Option<String>,
+    /// Commit ids of HEAD and the upstream, to notice commits and fetches.
+    pub head_id: String,
+    pub upstream_id: String,
+    /// When the last fetch happened (FETCH_HEAD's mtime, unix seconds).
+    pub fetched: Option<i64>,
     pub staged: Vec<Change>,
     pub unstaged: Vec<Change>,
     /// Absolute path -> kind to show in the tree.
@@ -111,12 +118,20 @@ pub fn status(root: &Path) -> Option<Status> {
             .and_then(|r| r.symbolic_target().ok().flatten().map(|s| s.trim_start_matches("refs/heads/").to_string()))
             .unwrap_or_else(|| "main".into()),
     };
+    st.fetched = std::fs::metadata(repo.path().join("FETCH_HEAD"))
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64);
     if let Ok(head) = repo.head() {
+        st.head_id = head.target().map(|o| o.to_string()).unwrap_or_default();
         if let (Some(local), Ok(name)) = (head.target(), head.name().map(str::to_string)) {
             if let Ok(up) = repo.branch_upstream_name(&name) {
                 if let Ok(up) = up.as_str() {
+                    st.upstream = Some(up.trim_start_matches("refs/remotes/").to_string());
                     if let Ok(r) = repo.find_reference(up) {
                         if let Some(remote) = r.target() {
+                            st.upstream_id = remote.to_string();
                             if let Ok((a, b)) = repo.graph_ahead_behind(local, remote) {
                                 st.ahead = a;
                                 st.behind = b;
@@ -316,3 +331,152 @@ pub fn commit(root: &Path, message: &str, all: bool) -> Result<String, String> {
 }
 
 use gtk::gio::prelude::FileExt;
+
+
+// ------------------------------------------------------------------ history
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Flow {
+    /// In both HEAD and the upstream (or there is no upstream).
+    Shared,
+    /// Only in HEAD: ready to push.
+    Outgoing,
+    /// Only in the upstream: ready to pull.
+    Incoming,
+}
+
+#[derive(Clone, Debug)]
+pub struct Commit {
+    pub id: String,
+    pub summary: String,
+    pub message: String,
+    pub author: String,
+    pub time: i64,
+    pub merge: bool,
+    pub refs: Vec<String>,
+    pub head: bool,
+    pub flow: Flow,
+}
+
+/// Recent commits of HEAD and its upstream, newest first.
+pub fn log(root: &Path, limit: usize) -> Vec<Commit> {
+    let Some(repo) = open(root) else { return Vec::new() };
+    let Some(head) = repo.head().ok().and_then(|h| h.target()) else { return Vec::new() };
+    let upstream = repo
+        .head()
+        .ok()
+        .and_then(|h| h.name().map(str::to_string).ok())
+        .and_then(|n| repo.branch_upstream_name(&n).ok())
+        .and_then(|b| b.as_str().ok().map(str::to_string))
+        .and_then(|u| repo.find_reference(&u).ok())
+        .and_then(|r| r.target());
+
+    let only = |from: git2::Oid, hide: git2::Oid| -> HashSet<git2::Oid> {
+        let mut out = HashSet::new();
+        if let Ok(mut w) = repo.revwalk() {
+            if w.push(from).is_ok() && w.hide(hide).is_ok() {
+                out.extend(w.flatten().take(1000));
+            }
+        }
+        out
+    };
+    let (outgoing, incoming) = match upstream {
+        Some(up) => (only(head, up), only(up, head)),
+        None => (HashSet::new(), HashSet::new()),
+    };
+
+    // Branch and tag names by commit.
+    let mut refs: HashMap<git2::Oid, Vec<String>> = HashMap::new();
+    if let Ok(it) = repo.references() {
+        for r in it.flatten() {
+            let Ok(name) = r.shorthand().map(str::to_string) else { continue };
+            if name.ends_with("/HEAD") || r.is_note() {
+                continue;
+            }
+            if let Ok(c) = r.peel_to_commit() {
+                refs.entry(c.id()).or_default().push(name);
+            }
+        }
+    }
+
+    let mut out = Vec::new();
+    let Ok(mut walk) = repo.revwalk() else { return out };
+    let _ = walk.set_sorting(git2::Sort::TOPOLOGICAL | git2::Sort::TIME);
+    let _ = walk.push(head);
+    if let Some(up) = upstream {
+        let _ = walk.push(up);
+    }
+    for oid in walk.flatten().take(limit) {
+        let Ok(c) = repo.find_commit(oid) else { continue };
+        let flow = if outgoing.contains(&oid) {
+            Flow::Outgoing
+        } else if incoming.contains(&oid) {
+            Flow::Incoming
+        } else {
+            Flow::Shared
+        };
+        let mut r = refs.remove(&oid).unwrap_or_default();
+        r.sort_by_key(|n| (n.contains('/'), n.clone()));
+        out.push(Commit {
+            id: oid.to_string(),
+            summary: c.summary().ok().flatten().unwrap_or("").to_string(),
+            message: c.message().ok().unwrap_or("").trim_end().to_string(),
+            author: c.author().name().ok().unwrap_or("").to_string(),
+            time: c.time().seconds(),
+            merge: c.parent_count() > 1,
+            refs: r,
+            head: oid == head,
+            flow,
+        });
+    }
+    out
+}
+
+/// `git show` of one commit: message, file stats and the patch.
+pub fn show(root: &Path, id: &str) -> Result<String, String> {
+    git(root, &["show", "--stat", "--patch", "--format=fuller", "--no-color", id], None)
+}
+
+// ------------------------------------------------------------------ remotes
+
+/// Network git: never prompt (philly has no terminal); ssh keys via the agent.
+fn git_net(root: &Path, args: &[&str]) -> Result<String, String> {
+    let mut cmd = Command::new("git");
+    cmd.arg("-C").arg(root).args(args);
+    cmd.env("GIT_TERMINAL_PROMPT", "0");
+    let has_ssh_cmd = std::env::var_os("GIT_SSH_COMMAND").is_some()
+        || git(root, &["config", "core.sshCommand"], None).map(|s| !s.trim().is_empty()).unwrap_or(false);
+    if !has_ssh_cmd {
+        cmd.env("GIT_SSH_COMMAND", "ssh -o BatchMode=yes -o ConnectTimeout=15");
+    }
+    cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    let out = cmd.output().map_err(|e| e.to_string())?;
+    if out.status.success() {
+        Ok(String::from_utf8_lossy(&out.stdout).to_string())
+    } else {
+        let err = String::from_utf8_lossy(&out.stderr);
+        // The last meaningful line is usually the reason.
+        let line = err.lines().rev().find(|l| !l.trim().is_empty() && !l.starts_with("hint:")).unwrap_or("git failed");
+        Err(line.trim().trim_start_matches("fatal: ").trim_start_matches("error: ").to_string())
+    }
+}
+
+pub fn fetch(root: &Path) -> Result<(), String> {
+    git_net(root, &["fetch", "--prune"]).map(|_| ())
+}
+
+/// Fast-forward only: a pull never creates a merge commit or conflicts.
+pub fn pull(root: &Path) -> Result<(), String> {
+    git_net(root, &["pull", "--ff-only"]).map(|_| ())
+}
+
+/// Push; a branch without an upstream is published to its remote (origin).
+pub fn push(root: &Path, publish: bool) -> Result<(), String> {
+    if publish {
+        let remotes = git(root, &["remote"], None)?;
+        let remote = remotes.lines().find(|r| *r == "origin").or_else(|| remotes.lines().next()).ok_or("This repository has no remote")?.to_string();
+        git_net(root, &["push", "-u", &remote, "HEAD"]).map(|_| ())
+    } else {
+        git_net(root, &["push"]).map(|_| ())
+    }
+}

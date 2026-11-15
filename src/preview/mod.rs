@@ -659,6 +659,51 @@ impl Preview {
         let _ = &self.info_holder;
     }
 
+    /// A commit from the source control panel: message, stats and patch.
+    pub fn show_commit(&self, root: &Path, c: &git::Commit) {
+        let gen = self.next_gen();
+        *self.shown.borrow_mut() = Shown::Nothing;
+        self.icon.set_text("\u{f417}");
+        self.title.set_text(&c.summary);
+        let when = glib::DateTime::from_unix_local(c.time).and_then(|d| d.format("%-d %b %Y %H:%M")).map(|s| s.to_string()).unwrap_or_default();
+        self.meta.set_text(&format!("{} · {} · {when}", &c.id[..7.min(c.id.len())], c.author));
+        self.split_btn.set_visible(false);
+        self.source_btn.set_visible(false);
+        self.open_btn.set_visible(false);
+        let (root, id) = (root.to_path_buf(), c.id.clone());
+        let code_buf = self.code_buf.clone();
+        let code_view = self.code_view.clone();
+        let stack = self.stack.clone();
+        let gen_ref = self.gen_ref();
+        glib::spawn_future_local(async move {
+            let text = gio::spawn_blocking(move || git::show(&root, &id)).await.ok().map(|r| r.unwrap_or_else(|e| e));
+            if gen_ref.get() != gen {
+                return;
+            }
+            let mut text = text.unwrap_or_default();
+            if text.len() > MAX_TEXT {
+                let mut cut = MAX_TEXT;
+                while !text.is_char_boundary(cut) {
+                    cut -= 1;
+                }
+                text.truncate(cut);
+            }
+            let lm = sourceview5::LanguageManager::default();
+            code_buf.set_language(lm.language("diff").as_ref());
+            code_buf.set_highlight_syntax(true);
+            if let Some(s) = theme::source_scheme() {
+                code_buf.set_style_scheme(Some(&s));
+            }
+            code_buf.set_text(&text);
+            let start = code_buf.start_iter();
+            code_buf.place_cursor(&start);
+            stack.set_visible_child_name("code");
+            if let Some(adj) = code_view.parent().and_downcast::<gtk::ScrolledWindow>().map(|s| s.vadjustment()) {
+                adj.set_value(0.0);
+            }
+        });
+    }
+
     pub fn show_diff(&self, root: &Path, ch: &git::Change) {
         let gen = self.next_gen();
         *self.shown.borrow_mut() = Shown::Diff(root.to_path_buf(), ch.clone());

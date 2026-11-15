@@ -515,6 +515,12 @@ impl Win {
         }));
 
         let w = self.weak();
+        self.git.cb.borrow_mut().show_commit = Some(Box::new(move |root, c| {
+            if let Some(w) = w.upgrade() {
+                w.preview.show_commit(&root, &c);
+            }
+        }));
+        let w = self.weak();
         self.git.cb.borrow_mut().select = Some(Box::new(move |root, ch| {
             if let Some(w) = w.upgrade() {
                 w.preview.show_diff(&root, &ch);

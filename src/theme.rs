@@ -311,6 +311,25 @@ treeexpander expander {{ min-width: 16px; color: {dim}; -gtk-icon-size: 12px; }}
 .commit-btn {{ margin: 0 12px 10px 12px; min-height: 30px; border-radius: 6px; font-weight: 600; }}
 .branch {{ color: {dim}; font-size: 0.85em; padding: 0 14px 4px 14px; }}
 .git-empty {{ color: {dim}; padding: 24px; }}
+.navigation-sidebar.git-list > row {{ min-height: 22px; padding: 0; margin: 0 4px; border-radius: 4px; }}
+.navigation-sidebar.git-list {{ padding: 2px 0; }}
+.git-list .tree-row button {{ min-width: 20px; min-height: 20px; padding: 0; margin: 0; }}
+.sync-label {{ color: {dim}; font-size: 0.85em; padding: 0 14px 6px 14px; }}
+.sync-btns {{ margin: 0 12px 4px 12px; }}
+.sync-btn {{ min-height: 26px; padding: 0 8px; border-radius: 6px; font-size: 0.9em; }}
+.sync-btn.pending {{ color: {accent}; box-shadow: inset 0 0 0 1px {accent}; }}
+.git-paned > separator {{ background: {border}; min-height: 1px; }}
+.commits-header {{ margin-top: 2px; }}
+.commits-count {{ color: {accent}; font-size: 0.8em; font-weight: 700; }}
+.commit-row {{ padding: 0 6px 0 2px; min-height: 22px; }}
+.commit-row .commit-graph {{ color: {dim}; }}
+.commit-row.outgoing .commit-graph {{ color: {accent}; }}
+.commit-row.incoming .commit-graph {{ color: {cyan}; }}
+.commit-row.incoming .commit-summary {{ color: {dim}; font-style: italic; }}
+.commit-row .commit-summary {{ color: {fg}; font-size: 0.92em; }}
+.commit-row .commit-age {{ color: {dim}; font-size: 0.8em; }}
+.ref-badge {{ background: {accent}; color: {darker}; border-radius: 99px; padding: 0 6px; font-size: 0.75em; font-weight: 700; }}
+.ref-badge.remote {{ background: none; color: {cyan}; box-shadow: inset 0 0 0 1px {cyan}; }}
 
 /* ---------- search ---------- */
 .search-box {{ margin: 6px 12px; }}
