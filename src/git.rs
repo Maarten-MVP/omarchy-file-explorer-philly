@@ -454,11 +454,14 @@ fn git_net(root: &Path, args: &[&str]) -> Result<String, String> {
     if out.status.success() {
         Ok(String::from_utf8_lossy(&out.stdout).to_string())
     } else {
-        let err = String::from_utf8_lossy(&out.stderr);
-        // The last meaningful line is usually the reason.
-        let line = err.lines().rev().find(|l| !l.trim().is_empty() && !l.starts_with("hint:")).unwrap_or("git failed");
-        Err(line.trim().trim_start_matches("fatal: ").trim_start_matches("error: ").to_string())
+        Err(reason(&String::from_utf8_lossy(&out.stderr)))
     }
+}
+
+/// The line of git's error output that says why it failed: usually the last one.
+fn reason(stderr: &str) -> String {
+    let line = stderr.lines().rev().find(|l| !l.trim().is_empty() && !l.starts_with("hint:")).unwrap_or("git failed");
+    line.trim().trim_start_matches("fatal: ").trim_start_matches("error: ").to_string()
 }
 
 pub fn fetch(root: &Path) -> Result<(), String> {
@@ -478,5 +481,144 @@ pub fn push(root: &Path, publish: bool) -> Result<(), String> {
         git_net(root, &["push", "-u", &remote, "HEAD"]).map(|_| ())
     } else {
         git_net(root, &["push"]).map(|_| ())
+    }
+}
+
+/// Pull with rebase, then push. philly has no terminal to finish a rebase in, so
+/// this never leaves one behind: what can't be done cleanly is undone and reported.
+pub fn sync(root: &Path) -> Result<String, String> {
+    git_net(root, &["fetch", "--prune"])?;
+    let counts = git(root, &["rev-list", "--left-right", "--count", "HEAD...@{upstream}"], None)
+        .map_err(|_| "This branch's upstream is gone from the remote".to_string())?;
+    let mut counts = counts.split_whitespace().map(|n| n.parse::<usize>().unwrap_or(0));
+    let (ahead, behind) = (counts.next().unwrap_or(0), counts.next().unwrap_or(0));
+
+    if behind > 0 {
+        // Uncommitted changes are stashed around the rebase. Putting them back can only
+        // conflict in a file the remote changed too, so stop before touching anything.
+        let names = |args: &[&str]| -> Result<HashSet<String>, String> {
+            Ok(git(root, args, None).map_err(|e| reason(&e))?.split('\0').filter(|f| !f.is_empty()).map(str::to_string).collect())
+        };
+        let incoming = names(&["diff", "--name-only", "--no-renames", "-z", "HEAD...@{upstream}"])?;
+        let dirty = names(&["diff", "--name-only", "--no-renames", "-z", "HEAD"])?;
+        if let Some(f) = dirty.intersection(&incoming).min() {
+            return Err(format!("Sync stopped: {f} has uncommitted changes and also changed on the remote"));
+        }
+        if let Err(e) = git_net(root, &["rebase", "--rebase-merges", "--autostash", "@{upstream}"]) {
+            let stopped_halfway = ["rebase-merge", "rebase-apply"].iter().any(|dir| {
+                git(root, &["rev-parse", "--git-path", dir], None).map(|p| root.join(p.trim()).exists()).unwrap_or(false)
+            });
+            if !stopped_halfway {
+                return Err(e);
+            }
+            git(root, &["rebase", "--abort"], None).map_err(|e| reason(&e))?;
+            return Err("Sync stopped: your commits conflict with the remote's. Nothing was changed.".into());
+        }
+    }
+    if ahead > 0 {
+        git_net(root, &["push"]).map_err(|e| if behind > 0 { format!("Pulled, but the push failed: {e}") } else { e })?;
+    }
+
+    let commits = |n: usize| format!("{n} commit{}", if n == 1 { "" } else { "s" });
+    Ok(match (behind, ahead) {
+        (0, 0) => "Already in sync".into(),
+        (b, 0) => format!("Pulled {}", commits(b)),
+        (0, a) => format!("Pushed {}", commits(a)),
+        (b, a) => format!("Pulled {}, pushed {}", commits(b), commits(a)),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn run(dir: &Path, args: &[&str]) -> String {
+        git(dir, args, None).unwrap_or_else(|e| panic!("git {args:?}: {e}"))
+    }
+
+    fn write(dir: &Path, name: &str, text: &str) {
+        std::fs::write(dir.join(name), text).unwrap();
+    }
+
+    fn commit_file(dir: &Path, name: &str, text: &str) {
+        write(dir, name, text);
+        run(dir, &["add", "-A"]);
+        run(dir, &["commit", "-q", "-m", name]);
+    }
+
+    /// A remote with one commit and two clones of it: (scratch dir, mine, theirs).
+    fn clones(name: &str) -> (PathBuf, PathBuf, PathBuf) {
+        let base = std::env::temp_dir().join(format!("philly-sync-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        run(&base, &["init", "-q", "--bare", "-b", "main", "remote.git"]);
+        let (mine, theirs) = (base.join("mine"), base.join("theirs"));
+        for dir in [&mine, &theirs] {
+            run(&base, &["clone", "-q", "remote.git", dir.to_str().unwrap()]);
+            for (k, v) in [("user.name", "t"), ("user.email", "t@example.com"), ("commit.gpgsign", "false")] {
+                run(dir, &["config", k, v]);
+            }
+        }
+        commit_file(&mine, "a.txt", "one\n");
+        run(&mine, &["push", "-q", "-u", "origin", "main"]);
+        run(&theirs, &["pull", "-q", "origin", "main"]);
+        (base, mine, theirs)
+    }
+
+    fn head(dir: &Path, rev: &str) -> String {
+        run(dir, &["rev-parse", rev]).trim().to_string()
+    }
+
+    #[test]
+    fn sync_rebases_then_pushes_and_keeps_uncommitted_work() {
+        let (base, mine, theirs) = clones("clean");
+        commit_file(&theirs, "b.txt", "theirs\n");
+        run(&theirs, &["push", "-q"]);
+        commit_file(&mine, "c.txt", "mine\n");
+        write(&mine, "a.txt", "one\nnot committed\n");
+
+        assert_eq!(sync(&mine).unwrap(), "Pulled 1 commit, pushed 1 commit");
+        assert_eq!(head(&mine, "HEAD"), head(&mine, "origin/main"));
+        assert_eq!(run(&mine, &["rev-list", "--merges", "--count", "HEAD"]).trim(), "0");
+        assert!(mine.join("b.txt").exists());
+        assert_eq!(std::fs::read_to_string(mine.join("a.txt")).unwrap(), "one\nnot committed\n");
+        assert_eq!(run(&mine, &["stash", "list"]), "");
+        assert_eq!(sync(&mine).unwrap(), "Already in sync");
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn sync_undoes_a_rebase_that_conflicts() {
+        let (base, mine, theirs) = clones("conflict");
+        commit_file(&theirs, "a.txt", "theirs\n");
+        run(&theirs, &["push", "-q"]);
+        commit_file(&mine, "a.txt", "mine\n");
+        write(&mine, "notes.txt", "not committed\n");
+        let before = head(&mine, "HEAD");
+
+        let err = sync(&mine).unwrap_err();
+        assert!(err.contains("conflict"), "{err}");
+        assert_eq!(head(&mine, "HEAD"), before);
+        assert!(!mine.join(".git/rebase-merge").exists());
+        assert_eq!(std::fs::read_to_string(mine.join("a.txt")).unwrap(), "mine\n");
+        assert!(mine.join("notes.txt").exists());
+        assert_eq!(head(&theirs, "HEAD"), head(&mine, "origin/main"));
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn sync_stops_when_uncommitted_work_overlaps_the_remote() {
+        let (base, mine, theirs) = clones("overlap");
+        commit_file(&theirs, "a.txt", "theirs\n");
+        run(&theirs, &["push", "-q"]);
+        write(&mine, "a.txt", "mine, not committed\n");
+        let before = head(&mine, "HEAD");
+
+        let err = sync(&mine).unwrap_err();
+        assert!(err.contains("a.txt"), "{err}");
+        assert_eq!(head(&mine, "HEAD"), before);
+        assert_eq!(std::fs::read_to_string(mine.join("a.txt")).unwrap(), "mine, not committed\n");
+        assert_eq!(run(&mine, &["stash", "list"]), "");
+        let _ = std::fs::remove_dir_all(base);
     }
 }

@@ -419,6 +419,8 @@ treeexpander expander {{ min-width: 16px; color: {dim}; -gtk-icon-size: 12px; }}
 .sync-btns {{ margin: 0 12px 4px 12px; }}
 .sync-btn {{ min-height: 26px; padding: 0 8px; border-radius: 6px; font-size: 0.9em; }}
 .sync-btn.pending {{ color: {accent}; box-shadow: inset 0 0 0 1px {accent}; }}
+.sync-all {{ min-width: 26px; min-height: 26px; padding: 0 4px; border-radius: 6px; font-size: 0.9em; color: {dim}; }}
+.sync-all:hover {{ color: {bright}; }}
 .git-paned > separator {{ background: {border}; min-height: 1px; }}
 .commits-header {{ margin-top: 2px; }}
 .commits-count {{ color: {accent}; font-size: 0.8em; font-weight: 700; }}

@@ -30,8 +30,9 @@ pub struct GitPanel {
     rows: RefCell<Vec<Change>>,
     pull_btn: gtk::Button,
     push_btn: gtk::Button,
+    sync_btn: gtk::Button,
     fetch_btn: gtk::Button,
-    /// A fetch / pull / push is running.
+    /// A fetch / pull / push / sync is running.
     busy: Cell<bool>,
     commits: gtk::ListBox,
     commit_rows: RefCell<Vec<Commit>>,
@@ -103,11 +104,17 @@ impl GitPanel {
         // Push / pull state and buttons.
         let pull_btn = gtk::Button::builder().css_classes(["sync-btn"]).tooltip_text("Pull (fast-forward only)").hexpand(true).build();
         let push_btn = gtk::Button::builder().css_classes(["sync-btn"]).hexpand(true).build();
-        let sync_btns = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        let pull_push = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        pull_push.set_homogeneous(true);
+        pull_push.set_hexpand(true);
+        pull_push.append(&pull_btn);
+        pull_push.append(&push_btn);
+        // Both in one go, kept quiet next to the two real buttons.
+        let sync_btn = gtk::Button::builder().label("↓↑").css_classes(["flat", "sync-all"]).build();
+        let sync_btns = gtk::Box::new(gtk::Orientation::Horizontal, 4);
         sync_btns.add_css_class("sync-btns");
-        sync_btns.set_homogeneous(true);
-        sync_btns.append(&pull_btn);
-        sync_btns.append(&push_btn);
+        sync_btns.append(&pull_push);
+        sync_btns.append(&sync_btn);
 
         // Recent commits, like VS Code's graph.
         let commits_title = gtk::Label::builder().label("COMMITS").xalign(0.0).build();
@@ -189,6 +196,7 @@ impl GitPanel {
             rows: RefCell::new(Vec::new()),
             pull_btn,
             push_btn,
+            sync_btn,
             fetch_btn,
             busy: Cell::new(false),
             commits,
@@ -227,6 +235,12 @@ impl GitPanel {
             if let Some(p) = w.upgrade() {
                 let publish = p.status.borrow().as_ref().map(|s| s.upstream.is_none()).unwrap_or(false);
                 p.remote(if publish { "Publishing…" } else { "Pushing…" }, if publish { "Published" } else { "Pushed" }, move |r| git::push(r, publish));
+            }
+        });
+        let w = Rc::downgrade(&p);
+        p.sync_btn.connect_clicked(move |_| {
+            if let Some(p) = w.upgrade() {
+                p.remote_with("Syncing…", git::sync);
             }
         });
         let w = Rc::downgrade(&p);
@@ -503,6 +517,9 @@ impl GitPanel {
             self.push_btn.set_tooltip_text(Some(&format!("Push\n{text}")));
         }
         self.push_btn.set_sensitive(!busy && (st.upstream.is_none() || st.ahead > 0));
+        // Sync fetches first, so it stays available when nothing is known to be waiting.
+        self.sync_btn.set_tooltip_text(Some(&format!("Sync: pull with rebase, then push\n{text}")));
+        self.sync_btn.set_sensitive(!busy && st.upstream.is_some());
         self.pull_btn.set_css_classes(if st.behind > 0 { &["sync-btn", "pending"] } else { &["sync-btn"] });
         self.push_btn.set_css_classes(if st.ahead > 0 || st.upstream.is_none() { &["sync-btn", "pending"] } else { &["sync-btn"] });
         self.fetch_btn.set_sensitive(!busy && st.upstream.is_some());
@@ -510,12 +527,17 @@ impl GitPanel {
 
     /// Run a fetch / pull / push in the background, then refresh.
     fn remote(&self, doing: &str, done: &'static str, f: impl FnOnce(&Path) -> Result<(), String> + Send + 'static) {
+        self.remote_with(doing, move |root| f(root).map(|_| done.to_string()));
+    }
+
+    /// Like `remote`, for work that reports what it did.
+    fn remote_with(&self, doing: &str, f: impl FnOnce(&Path) -> Result<String, String> + Send + 'static) {
         let Some(root) = self.root() else { return };
         if self.busy.replace(true) {
             return;
         }
         self.pull_btn.set_label(doing);
-        for b in [&self.pull_btn, &self.push_btn, &self.fetch_btn] {
+        for b in [&self.pull_btn, &self.push_btn, &self.sync_btn, &self.fetch_btn] {
             b.set_sensitive(false);
         }
         let w = self.me.borrow().clone();
@@ -523,10 +545,7 @@ impl GitPanel {
             let res = gtk::gio::spawn_blocking(move || f(&root)).await.unwrap_or(Err("failed".into()));
             let Some(p) = w.upgrade() else { return };
             p.busy.set(false);
-            match res {
-                Ok(()) => p.toast(done),
-                Err(e) => p.toast(e),
-            }
+            p.toast(res.unwrap_or_else(|e| e));
             // Restore the sync line now; the refresh updates it if anything moved.
             if let Some(st) = p.status.borrow().clone() {
                 p.update_sync(&st);
