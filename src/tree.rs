@@ -1,5 +1,6 @@
-//! The VS Code style file tree: a lazily loaded GtkTreeListModel with live
-//! file watching, git decorations, ignore dimming and type-to-filter.
+//! The file list: a GtkColumnView (name, size, modified, kind) over a lazily
+//! loaded GtkTreeListModel, with live file watching, git decorations, ignore
+//! dimming, sorting by column and type-to-filter.
 
 use crate::git;
 use crate::icons;
@@ -16,6 +17,10 @@ pub struct Node {
     pub is_dir: bool,
     pub is_link: bool,
     pub ignored: bool,
+    /// Size in bytes (files).
+    pub size: u64,
+    /// Modification time (unix seconds, 0 = unknown); deletion time in the trash.
+    pub mtime: i64,
     /// Set for items in the trash view.
     pub trash: Option<TrashInfo>,
 }
@@ -70,8 +75,123 @@ fn natural_cmp(a: &str, b: &str) -> std::cmp::Ordering {
     }
 }
 
-fn sort_nodes(v: &mut [Node]) {
-    v.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then_with(|| natural_cmp(&a.name, &b.name)));
+/// The column the file list is sorted by.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SortKey {
+    Name,
+    Size,
+    Modified,
+    Kind,
+}
+
+impl SortKey {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SortKey::Name => "name",
+            SortKey::Size => "size",
+            SortKey::Modified => "modified",
+            SortKey::Kind => "kind",
+        }
+    }
+    pub fn parse(s: &str) -> SortKey {
+        match s {
+            "size" => SortKey::Size,
+            "modified" => SortKey::Modified,
+            "kind" => SortKey::Kind,
+            _ => SortKey::Name,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Sort {
+    pub key: SortKey,
+    pub desc: bool,
+}
+
+impl Default for Sort {
+    fn default() -> Self {
+        Sort { key: SortKey::Name, desc: false }
+    }
+}
+
+/// Folders always come first; ties are broken by name.
+fn sort_nodes(v: &mut [Node], sort: Sort) {
+    use std::cmp::Ordering;
+    v.sort_by(|a, b| {
+        b.is_dir.cmp(&a.is_dir).then_with(|| {
+            let o = match sort.key {
+                SortKey::Name => Ordering::Equal,
+                // Folders have no size of their own: keep them by name.
+                SortKey::Size if a.is_dir => Ordering::Equal,
+                SortKey::Size => a.size.cmp(&b.size),
+                SortKey::Modified => a.mtime.cmp(&b.mtime),
+                SortKey::Kind => kind_of(&a.name, a.is_dir).cmp(&kind_of(&b.name, b.is_dir)),
+            };
+            let o = o.then_with(|| natural_cmp(&a.name, &b.name));
+            if sort.desc {
+                o.reverse()
+            } else {
+                o
+            }
+        })
+    });
+}
+
+thread_local! {
+    static KINDS: RefCell<HashMap<String, String>> = RefCell::new(HashMap::new());
+}
+
+/// Human description of a file type ("Rust source code", "PNG image"), cached
+/// per extension.
+pub fn kind_of(name: &str, is_dir: bool) -> String {
+    if is_dir {
+        return "Folder".into();
+    }
+    let key = match name.rsplit_once('.') {
+        Some((stem, ext)) if !stem.is_empty() => ext.to_lowercase(),
+        _ => format!("/{name}"),
+    };
+    KINDS.with(|k| {
+        k.borrow_mut()
+            .entry(key)
+            .or_insert_with(|| {
+                let (ct, _) = gio::content_type_guess(Some(name), None);
+                let mut d = gio::content_type_get_description(&ct).to_string();
+                if let Some(c) = d.get(..1) {
+                    d = c.to_uppercase() + &d[1..];
+                }
+                d
+            })
+            .clone()
+    })
+}
+
+/// "Today 14:32", "Mon 09:10", "12 Nov", "3 Feb 2024".
+pub fn format_time(secs: i64) -> String {
+    if secs <= 0 {
+        return String::new();
+    }
+    let Ok(t) = glib::DateTime::from_unix_local(secs) else { return String::new() };
+    let Ok(now) = glib::DateTime::now_local() else { return String::new() };
+    let days = |d: &glib::DateTime| d.year() as i64 * 400 + d.day_of_year() as i64;
+    let ago = days(&now) - days(&t);
+    let fmt = if ago == 0 {
+        "Today %H:%M"
+    } else if ago == 1 {
+        "Yesterday %H:%M"
+    } else if (2..7).contains(&ago) {
+        "%a %H:%M"
+    } else if t.year() == now.year() {
+        "%e %b"
+    } else {
+        "%e %b %Y"
+    };
+    t.format(fmt).map(|s| s.trim().to_string()).unwrap_or_default()
+}
+
+fn mtime_of(m: &std::fs::Metadata) -> i64 {
+    m.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_secs() as i64).unwrap_or(0)
 }
 
 /// Directories never shown in the tree (like VS Code's files.exclude defaults).
@@ -79,7 +199,7 @@ fn excluded(name: &str) -> bool {
     matches!(name, ".git" | ".hg" | ".svn" | ".DS_Store")
 }
 
-pub fn read_dir(dir: &Path, ignore: &git::IgnoreChecker, parent_ignored: bool) -> Vec<Node> {
+pub fn read_dir(dir: &Path, ignore: &git::IgnoreChecker, parent_ignored: bool, sort: Sort) -> Vec<Node> {
     let mut out = Vec::new();
     let Ok(rd) = std::fs::read_dir(dir) else { return out };
     for e in rd.flatten() {
@@ -92,13 +212,16 @@ pub fn read_dir(dir: &Path, ignore: &git::IgnoreChecker, parent_ignored: bool) -
         let is_link = ft.map(|f| f.is_symlink()).unwrap_or(false);
         let is_dir = if is_link { path.is_dir() } else { ft.map(|f| f.is_dir()).unwrap_or(false) };
         let ignored = parent_ignored || ignore.is_ignored(&path);
-        out.push(Node { path, name, is_dir, is_link, ignored, trash: None });
+        let meta = if is_link { std::fs::metadata(&path).ok() } else { e.metadata().ok() };
+        let size = meta.as_ref().filter(|m| !m.is_dir()).map(|m| m.len()).unwrap_or(0);
+        let mtime = meta.as_ref().map(mtime_of).unwrap_or(0);
+        out.push(Node { path, name, is_dir, is_link, ignored, size, mtime, trash: None });
     }
-    sort_nodes(&mut out);
+    sort_nodes(&mut out, sort);
     out
 }
 
-fn read_trash() -> Vec<Node> {
+fn read_trash(sort: Sort) -> Vec<Node> {
     let mut out = Vec::new();
     let trash = gio::File::for_uri(TRASH_ROOT);
     let home_files = glib::user_data_dir().join("Trash/files");
@@ -119,17 +242,21 @@ fn read_trash() -> Vec<Node> {
             let uri = trash.child(&raw).uri().to_string();
             let real = home_files.join(raw_name.trim_start_matches('\\'));
             let real = if real.exists() { real } else { home_files.join(&display) };
+            let size = std::fs::symlink_metadata(&real).ok().filter(|m| !m.is_dir()).map(|m| m.len()).unwrap_or(0);
+            let mtime = glib::DateTime::from_iso8601(&deleted.replace(' ', "T"), Some(&glib::TimeZone::local())).map(|d| d.to_unix()).unwrap_or(0);
             out.push(Node {
                 path: real,
                 name: display,
                 is_dir: info.file_type() == gio::FileType::Directory,
                 is_link: false,
                 ignored: false,
+                size,
+                mtime,
                 trash: Some(TrashInfo { uri, orig, deleted }),
             });
         }
     }
-    out.sort_by(|a, b| b.trash.as_ref().unwrap().deleted.cmp(&a.trash.as_ref().unwrap().deleted));
+    sort_nodes(&mut out, sort);
     out
 }
 
@@ -145,6 +272,24 @@ struct Row {
     expanded_handler: RefCell<Option<(gtk::TreeListRow, glib::SignalHandlerId)>>,
 }
 
+/// The columns next to the name.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Col {
+    Size,
+    Modified,
+    Kind,
+}
+
+/// One size / modified / kind cell, recycled by the column view.
+struct AuxCell {
+    label: gtk::Label,
+    col: Col,
+    cell: glib::WeakRef<gtk::ListItem>,
+}
+
+/// Marks a cell's child widget with its list item, to map widgets to rows.
+const CELL_KEY: &str = "philly-cell";
+
 #[derive(Default)]
 pub struct Callbacks {
     pub selection: Option<Box<dyn Fn(Vec<Node>)>>,
@@ -152,13 +297,13 @@ pub struct Callbacks {
     pub context: Option<Box<dyn Fn(Option<Node>, f64, f64)>>,
     pub dropped: Option<Box<dyn Fn(Vec<gio::File>, PathBuf, gdk::DragAction)>>,
     pub status_changed: Option<Box<dyn Fn()>>,
-    /// Double-click on a folder: make it the root.
+    /// Enter or double-click on a folder: open it.
     pub open_root: Option<Box<dyn Fn(PathBuf)>>,
 }
 
 pub struct Tree {
     pub widget: gtk::Box,
-    pub list: gtk::ListView,
+    pub list: gtk::ColumnView,
     pub header_label: gtk::Label,
     root: RefCell<PathBuf>,
     repo_root: RefCell<Option<PathBuf>>,
@@ -167,13 +312,21 @@ pub struct Tree {
     monitors: RefCell<HashMap<PathBuf, gio::FileMonitor>>,
     pending_dirs: RefCell<HashSet<PathBuf>>,
     git_pending: Cell<bool>,
-    /// Set by a double-click, consumed by the ListView's activate.
-    double_click: Cell<bool>,
     git_running: Cell<bool>,
     git_again: Cell<bool>,
     git_last: Cell<Option<std::time::Instant>>,
     git_monitors: RefCell<Vec<gio::FileMonitor>>,
     rows: RefCell<Vec<Rc<Row>>>,
+    aux: RefCell<Vec<Rc<AuxCell>>>,
+    /// Item counts of folders (all, not hidden), for the size column.
+    dir_counts: RefCell<HashMap<PathBuf, (usize, usize)>>,
+    counting: RefCell<HashSet<PathBuf>>,
+    sort: Cell<Sort>,
+    columns: Vec<(gtk::ColumnViewColumn, SortKey)>,
+    /// Set while the sort indicator is changed from code.
+    sort_quiet: Cell<bool>,
+    cells_queued: Cell<bool>,
+    pub on_sort_changed: RefCell<Option<Box<dyn Fn(Sort)>>>,
     pub model: RefCell<Option<gtk::TreeListModel>>,
     pub selection: gtk::MultiSelection,
     filter: gtk::CustomFilter,
@@ -200,10 +353,28 @@ impl Tree {
     pub fn new() -> Rc<Tree> {
         let filter = gtk::CustomFilter::new(|_| true);
         let selection = gtk::MultiSelection::new(None::<gio::ListModel>);
-        let list = gtk::ListView::new(Some(selection.clone()), None::<gtk::ListItemFactory>);
+        let list = gtk::ColumnView::new(Some(selection.clone()));
         list.add_css_class("tree");
         list.set_vexpand(true);
         list.set_single_click_activate(false);
+        list.set_reorderable(false);
+        list.set_show_column_separators(false);
+        list.set_show_row_separators(false);
+        let mut columns = Vec::new();
+        for (title, key, width) in [("Name", SortKey::Name, -1), ("Size", SortKey::Size, 90), ("Modified", SortKey::Modified, 140), ("Kind", SortKey::Kind, 150)] {
+            let c = gtk::ColumnViewColumn::new(Some(title), None::<gtk::ListItemFactory>);
+            c.set_resizable(true);
+            if width > 0 {
+                c.set_fixed_width(crate::theme::px(width));
+            } else {
+                c.set_expand(true);
+            }
+            // The sorter only drives the header arrows: the folder stores are
+            // sorted by us (see resort), which keeps list positions simple.
+            c.set_sorter(Some(&gtk::CustomSorter::new(|_, _| gtk::Ordering::Equal)));
+            list.append_column(&c);
+            columns.push((c, key));
+        }
 
         let header_label = gtk::Label::builder().xalign(0.0).hexpand(true).ellipsize(gtk::pango::EllipsizeMode::Middle).build();
 
@@ -222,7 +393,7 @@ impl Tree {
         let scrolled = gtk::ScrolledWindow::builder()
             .child(&list)
             .vexpand(true)
-            .hscrollbar_policy(gtk::PolicyType::Never)
+            .hscrollbar_policy(gtk::PolicyType::Automatic)
             .build();
 
         let widget = gtk::Box::new(gtk::Orientation::Vertical, 0);
@@ -250,12 +421,19 @@ impl Tree {
             monitors: RefCell::new(HashMap::new()),
             pending_dirs: RefCell::new(HashSet::new()),
             git_pending: Cell::new(false),
-            double_click: Cell::new(false),
             git_running: Cell::new(false),
             git_again: Cell::new(false),
             git_last: Cell::new(None),
             git_monitors: RefCell::new(Vec::new()),
             rows: RefCell::new(Vec::new()),
+            aux: RefCell::new(Vec::new()),
+            dir_counts: RefCell::new(HashMap::new()),
+            counting: RefCell::new(HashSet::new()),
+            sort: Cell::new(Sort::default()),
+            columns,
+            sort_quiet: Cell::new(false),
+            cells_queued: Cell::new(false),
+            on_sort_changed: RefCell::new(None),
             model: RefCell::new(None),
             selection,
             filter,
@@ -284,7 +462,145 @@ impl Tree {
         t.setup_find();
         t.setup_dnd();
         t.setup_sticky();
+        t.setup_sort();
         t
+    }
+
+    fn setup_sort(self: &Rc<Self>) {
+        self.show_sort();
+        let Some(sorter) = self.list.sorter() else { return };
+        let w = Rc::downgrade(self);
+        sorter.connect_changed(move |s, _| {
+            let Some(t) = w.upgrade() else { return };
+            if t.sort_quiet.get() {
+                return;
+            }
+            let Some(cs) = s.downcast_ref::<gtk::ColumnViewSorter>() else { return };
+            let sort = match cs.primary_sort_column() {
+                Some(c) => Sort {
+                    key: t.columns.iter().find(|(col, _)| *col == c).map(|(_, k)| *k).unwrap_or(SortKey::Name),
+                    desc: cs.primary_sort_order() == gtk::SortType::Descending,
+                },
+                None => Sort::default(),
+            };
+            t.set_sort(sort);
+            if let Some(f) = t.on_sort_changed.borrow().as_ref() {
+                f(sort);
+            };
+        });
+    }
+
+    /// Put the header arrow on the sort column.
+    fn show_sort(&self) {
+        let sort = self.sort.get();
+        let col = self.columns.iter().find(|(_, k)| *k == sort.key).map(|(c, _)| c.clone());
+        self.sort_quiet.set(true);
+        // Clear first: the sorter keeps earlier columns as secondary keys and
+        // would show their arrows too.
+        self.list.sort_by_column(None, gtk::SortType::Ascending);
+        self.list.sort_by_column(col.as_ref(), if sort.desc { gtk::SortType::Descending } else { gtk::SortType::Ascending });
+        self.sort_quiet.set(false);
+    }
+
+    /// Sort the list by a column, keeping expanded folders and the selection.
+    pub fn set_sort(&self, sort: Sort) {
+        if self.sort.replace(sort) == sort {
+            return;
+        }
+        self.show_sort();
+        if let Some(c) = self.columns.iter().find(|(_, k)| *k == sort.key).map(|(c, _)| c) {
+            c.set_visible(true);
+        }
+        let root = self.root();
+        let store = self.stores.borrow().get(&root).and_then(|w| w.upgrade());
+        let Some(store) = store else { return };
+        let n = self.selection.n_items();
+        let mut expanded = Vec::new();
+        for i in 0..n {
+            if let Some(lr) = self.row_at(i) {
+                if lr.is_expanded() {
+                    if let Some(nd) = node_of(lr.upcast_ref()) {
+                        expanded.push(nd.path);
+                    }
+                }
+            }
+        }
+        let selected: Vec<PathBuf> = self.selected().into_iter().map(|n| n.path).collect();
+        let mut nodes: Vec<Node> = (0..store.n_items()).filter_map(|i| store.item(i).and_then(|o| node_of(&o))).collect();
+        sort_nodes(&mut nodes, sort);
+        let objs: Vec<glib::BoxedAnyObject> = nodes.into_iter().map(glib::BoxedAnyObject::new).collect();
+        // Child folders are read again (sorted) when their rows expand.
+        self.stores.borrow_mut().retain(|p, _| *p == root);
+        store.splice(0, store.n_items(), &objs);
+        for p in expanded {
+            self.expand(&p);
+        }
+        if let Some(first) = selected.first() {
+            self.reveal(first);
+            for p in &selected[1..] {
+                if let Some(pos) = self.find_pos(p, 0) {
+                    self.selection.select_item(pos, false);
+                }
+            }
+        } else {
+            self.list.scroll_to(0, None, gtk::ListScrollFlags::NONE, None);
+        }
+    }
+
+    /// Show only the columns that fit next to a readable name column.
+    pub fn fit_columns(&self, width: i32) {
+        let z = crate::theme::zoom();
+        let need = |px: f64| (px * z) as i32;
+        // (column index, minimum list width to show it); Kind goes first.
+        for (i, min) in [(1, need(300.0)), (2, need(400.0)), (3, need(560.0))] {
+            let (c, key) = &self.columns[i];
+            // The sort column stays: its header arrow tells how the list is sorted.
+            let show = width >= min || *key == self.sort.get().key;
+            if c.is_visible() != show {
+                c.set_visible(show);
+            }
+        }
+    }
+
+    fn scroll_to(&self, pos: u32, flags: gtk::ListScrollFlags) {
+        self.list.scroll_to(pos, None, flags, None);
+    }
+
+    /// List position of the row a widget inside the list belongs to.
+    fn pos_of_widget(&self, mut w: gtk::Widget) -> Option<u32> {
+        let list: &gtk::Widget = self.list.upcast_ref();
+        loop {
+            if &w == list {
+                return None;
+            }
+            if let Some(p) = cell_pos(&w) {
+                return Some(p);
+            }
+            if w.css_name() == "row" {
+                // A row: look at the cells' children.
+                let mut c = w.first_child();
+                while let Some(cell) = c {
+                    if let Some(p) = cell.first_child().and_then(|ch| cell_pos(&ch)) {
+                        return Some(p);
+                    }
+                    c = cell.next_sibling();
+                }
+                return None;
+            }
+            w = w.parent()?;
+        }
+    }
+
+    /// The column header (its height offsets the rows).
+    fn header_height(&self) -> f64 {
+        let mut c = self.list.first_child();
+        while let Some(w) = c {
+            if w.css_name() == "header" {
+                return w.height() as f64;
+            }
+            c = w.next_sibling();
+        }
+        0.0
     }
 
     fn setup_sticky(self: &Rc<Self>) {
@@ -317,10 +633,15 @@ impl Tree {
 
     /// Height of one tree row in pixels.
     fn row_height(&self) -> f64 {
+        // Rows live in the column view's inner list view.
         let mut c = self.list.first_child();
         while let Some(w) = c {
-            if w.css_name() == "row" && w.height() > 0 {
-                return w.height() as f64;
+            let mut r = w.first_child();
+            while let Some(row) = r {
+                if row.css_name() == "row" && row.height() > 0 {
+                    return row.height() as f64;
+                }
+                r = row.next_sibling();
             }
             c = w.next_sibling();
         }
@@ -332,13 +653,15 @@ impl Tree {
         let root = self.root();
         let scrolled_top = self.scroller.vadjustment().value() > 1.0;
         let mut chain: Vec<PathBuf> = Vec::new();
+        let top = self.header_height();
+        self.sticky.set_margin_top(top as i32);
         if scrolled_top && !self.is_trash() {
             let rh = self.row_height();
             // The rows under the sticky header are hidden by it, so look below
             // it; repeat until the number of sticky rows is stable.
             let mut k = 0usize;
             for _ in 0..MAX + 1 {
-                let Some(pos) = self.pos_at(12.0, k as f64 * rh + rh * 0.5) else { break };
+                let Some(pos) = self.pos_at(12.0, top + k as f64 * rh + rh * 0.5) else { break };
                 let Some(n) = self.row_at(pos).and_then(|lr| node_of(lr.upcast_ref())) else { break };
                 let mut anc: Vec<PathBuf> = n.path.ancestors().skip(1).take_while(|p| *p != root.as_path() && p.starts_with(&root)).map(Path::to_path_buf).collect();
                 anc.reverse();
@@ -383,7 +706,7 @@ impl Tree {
             click.connect_released(move |_, _, _, _| {
                 if let Some(t) = w.upgrade() {
                     if let Some(pos) = t.find_pos(&target, 0) {
-                        t.list.scroll_to(pos, gtk::ListScrollFlags::FOCUS | gtk::ListScrollFlags::SELECT, None);
+                        t.scroll_to(pos, gtk::ListScrollFlags::FOCUS | gtk::ListScrollFlags::SELECT);
                     }
                 }
             });
@@ -462,14 +785,15 @@ impl Tree {
 
     pub fn refilter(&self) {
         self.filter.changed(gtk::FilterChange::Different);
+        self.refresh_cells();
     }
 
     fn make_store(&self, dir: &Path, parent_ignored: bool) -> gio::ListModel {
         let store = gio::ListStore::new::<glib::BoxedAnyObject>();
         let nodes = if dir.as_os_str() == TRASH_ROOT {
-            read_trash()
+            read_trash(self.sort.get())
         } else {
-            read_dir(dir, &self.ignore.borrow(), parent_ignored)
+            read_dir(dir, &self.ignore.borrow(), parent_ignored, self.sort.get())
         };
         let objs: Vec<glib::BoxedAnyObject> = nodes.into_iter().map(glib::BoxedAnyObject::new).collect();
         store.extend_from_slice(&objs);
@@ -531,10 +855,12 @@ impl Tree {
         };
         let parent_ignored = self.ignore.borrow().is_ignored(dir);
         let new = if dir.as_os_str() == TRASH_ROOT {
-            read_trash()
+            read_trash(self.sort.get())
         } else {
-            read_dir(dir, &self.ignore.borrow(), parent_ignored)
+            read_dir(dir, &self.ignore.borrow(), parent_ignored, self.sort.get())
         };
+        // Its item count changed (shown in the parent's size column).
+        self.dir_counts.borrow_mut().remove(dir);
         let new_names: HashSet<&str> = new.iter().map(|n| n.name.as_str()).collect();
         // Remove vanished entries (back to front).
         let mut i = store.n_items();
@@ -549,7 +875,10 @@ impl Tree {
                 }
             }
         }
-        // Insert new entries in sorted position; update changed ones.
+        // Insert new entries in sorted position; update changed ones. When
+        // sorted by size or date an entry can also move.
+        let present: HashSet<String> = (0..store.n_items()).filter_map(|i| store.item(i).and_then(|o| node_of(&o))).map(|n| n.name).collect();
+        let mut meta_changed = false;
         for (pos, n) in new.into_iter().enumerate() {
             let pos = pos as u32;
             let cur = store.item(pos).and_then(|o| node_of(&o));
@@ -557,16 +886,117 @@ impl Tree {
                 Some(c) if c.name == n.name => {
                     if c.is_dir != n.is_dir || c.ignored != n.ignored {
                         store.splice(pos, 1, &[glib::BoxedAnyObject::new(n)]);
+                    } else if c.size != n.size || c.mtime != n.mtime || c.is_link != n.is_link {
+                        // Update in place: replacing the item would collapse a
+                        // folder and drop the selection.
+                        if let Some(obj) = store.item(pos).and_downcast::<glib::BoxedAnyObject>() {
+                            *obj.borrow_mut::<Node>() = n;
+                            meta_changed = true;
+                        }
                     }
                 }
-                _ => store.insert(pos, &glib::BoxedAnyObject::new(n)),
+                _ => {
+                    if present.contains(&n.name) {
+                        let old = (pos + 1..store.n_items()).find(|&i| store.item(i).and_then(|o| node_of(&o)).map(|c| c.name == n.name).unwrap_or(false));
+                        if let Some(i) = old {
+                            store.remove(i);
+                        }
+                    }
+                    store.insert(pos, &glib::BoxedAnyObject::new(n));
+                }
             }
+        }
+        if meta_changed {
+            self.refresh_cells();
         }
         if dir.as_os_str() == TRASH_ROOT {
             if let Some(f) = self.cb.borrow().status_changed.as_ref() {
                 f();
             }
         }
+    }
+
+    /// Re-read the size / modified / kind cells from their items.
+    pub fn refresh_cells(&self) {
+        self.aux.borrow_mut().retain(|a| a.cell.upgrade().is_some());
+        let cells: Vec<Rc<AuxCell>> = self.aux.borrow().clone();
+        for a in cells {
+            if let Some(li) = a.cell.upgrade() {
+                if let Some(n) = li.item().and_then(|o| node_of(&o)) {
+                    self.fill_cell(&a, &n);
+                }
+            }
+        }
+    }
+
+    fn fill_cell(&self, a: &AuxCell, n: &Node) {
+        let text = match a.col {
+            Col::Size if n.trash.is_some() && n.is_dir => String::new(),
+            Col::Size if n.is_dir => match self.dir_count(&n.path) {
+                Some(c) => crate::preview::items_label(c),
+                None => String::new(),
+            },
+            Col::Size => crate::preview::human(n.size),
+            Col::Modified => format_time(n.mtime),
+            Col::Kind => kind_of(&n.name, n.is_dir),
+        };
+        a.label.set_text(&text);
+        a.label.set_opacity(if n.ignored { 0.45 } else { 1.0 });
+    }
+
+    /// Item count of a folder, honouring "show hidden". Counted in the
+    /// background the first time; cells refresh when it is known.
+    fn dir_count(&self, dir: &Path) -> Option<usize> {
+        if let Some((all, visible)) = self.dir_counts.borrow().get(dir) {
+            return Some(if self.show_hidden.get() { *all } else { *visible });
+        }
+        if self.counting.borrow_mut().insert(dir.to_path_buf()) {
+            let w = self.weak();
+            let d = dir.to_path_buf();
+            glib::spawn_future_local(async move {
+                let d2 = d.clone();
+                let counts = gio::spawn_blocking(move || {
+                    let rd = std::fs::read_dir(&d2).ok()?;
+                    let (mut all, mut visible) = (0usize, 0usize);
+                    for e in rd.flatten() {
+                        let name = e.file_name();
+                        let name = name.to_string_lossy();
+                        if excluded(&name) {
+                            continue;
+                        }
+                        all += 1;
+                        if !name.starts_with('.') {
+                            visible += 1;
+                        }
+                    }
+                    Some((all, visible))
+                })
+                .await
+                .ok()
+                .flatten();
+                let Some(t) = w.upgrade() else { return };
+                t.counting.borrow_mut().remove(&d);
+                if let Some(c) = counts {
+                    t.dir_counts.borrow_mut().insert(d, c);
+                    t.queue_cells();
+                }
+            });
+        }
+        None
+    }
+
+    /// Refresh the cells once after a burst of folder counts.
+    fn queue_cells(&self) {
+        if self.cells_queued.replace(true) {
+            return;
+        }
+        let w = self.weak();
+        glib::idle_add_local_once(move || {
+            if let Some(t) = w.upgrade() {
+                t.cells_queued.set(false);
+                t.refresh_cells();
+            }
+        });
     }
 
     fn forget_subtree(&self, dir: &Path) {
@@ -659,6 +1089,7 @@ impl Tree {
         *self.root.borrow_mut() = dir.to_path_buf();
         self.stores.borrow_mut().clear();
         self.monitors.borrow_mut().clear();
+        self.dir_counts.borrow_mut().clear();
         let repo = if is_trash { None } else { git::discover(dir) };
         *self.ignore.borrow_mut() = Rc::new(git::IgnoreChecker::new(repo.as_deref()));
         let repo_changed = *self.repo_root.borrow() != repo;
@@ -747,6 +1178,9 @@ impl Tree {
     /// After a theme or zoom change: rows and the sticky header carry colours
     /// and pixel sizes set from code.
     pub fn restyle(&self) {
+        for (i, base) in [(1, 90), (2, 140), (3, 150)] {
+            self.columns[i].0.set_fixed_width(crate::theme::px(base));
+        }
         self.restyle_rows();
         self.sticky_paths.borrow_mut().clear();
         self.update_sticky();
@@ -759,7 +1193,7 @@ impl Tree {
             let li = li.downcast_ref::<gtk::ListItem>().unwrap();
             let icon = gtk::Label::new(None);
             icon.add_css_class("file-icon");
-            let name = gtk::Label::builder().xalign(0.0).hexpand(true).ellipsize(gtk::pango::EllipsizeMode::Middle).build();
+            let name = gtk::Label::builder().xalign(0.0).hexpand(true).width_chars(12).ellipsize(gtk::pango::EllipsizeMode::Middle).build();
             name.add_css_class("name");
             let detail = gtk::Label::builder().ellipsize(gtk::pango::EllipsizeMode::Start).max_width_chars(30).build();
             detail.add_css_class("detail");
@@ -779,6 +1213,7 @@ impl Tree {
             root.add_css_class("tree-row");
             root.append(&expander);
             li.set_child(Some(&root));
+            unsafe { root.set_data(CELL_KEY, li.downgrade()) };
             let row = Rc::new(Row {
                 root,
                 expander,
@@ -826,7 +1261,41 @@ impl Tree {
             *row.node.borrow_mut() = None;
             row.expander.set_list_row(None);
         });
-        self.list.set_factory(Some(&factory));
+        self.columns[0].0.set_factory(Some(&factory));
+
+        for (i, col) in [(1, Col::Size), (2, Col::Modified), (3, Col::Kind)] {
+            let factory = gtk::SignalListItemFactory::new();
+            let w = Rc::downgrade(self);
+            factory.connect_setup(move |_, li| {
+                let li = li.downcast_ref::<gtk::ListItem>().unwrap();
+                let label = gtk::Label::builder()
+                    .xalign(if col == Col::Size { 1.0 } else { 0.0 })
+                    .ellipsize(gtk::pango::EllipsizeMode::End)
+                    .build();
+                label.add_css_class("cell-detail");
+                if col == Col::Size {
+                    label.add_css_class("numeric");
+                }
+                li.set_child(Some(&label));
+                unsafe { label.set_data(CELL_KEY, li.downgrade()) };
+                let a = Rc::new(AuxCell { label, col, cell: li.downgrade() });
+                if let Some(t) = w.upgrade() {
+                    t.aux.borrow_mut().push(a.clone());
+                }
+                unsafe { li.set_data("philly-aux", a) };
+            });
+            let w = Rc::downgrade(self);
+            factory.connect_bind(move |_, li| {
+                let li = li.downcast_ref::<gtk::ListItem>().unwrap();
+                let Some(t) = w.upgrade() else { return };
+                let a: Rc<AuxCell> = unsafe { li.data::<Rc<AuxCell>>("philly-aux").unwrap().as_ref().clone() };
+                match li.item().and_then(|o| node_of(&o)) {
+                    Some(n) => t.fill_cell(&a, &n),
+                    None => a.label.set_text(""),
+                }
+            });
+            self.columns[i].0.set_factory(Some(&factory));
+        }
     }
 
     fn setup_signals(self: &Rc<Self>) {
@@ -844,58 +1313,17 @@ impl Tree {
             let Some(t) = w.upgrade() else { return };
             let Some(lr) = t.row_at(pos) else { return };
             let Some(n) = node_of(lr.upcast_ref()) else { return };
-            let double = t.double_click.replace(false);
             if n.is_dir && n.trash.is_none() {
-                if double {
-                    // Double-click: the folder becomes the root.
-                    if let Some(f) = t.cb.borrow().open_root.as_ref() {
-                        f(n.path.clone());
-                    }
-                    return;
+                // Enter or double-click on a folder: go into it.
+                if let Some(f) = t.cb.borrow().open_root.as_ref() {
+                    f(n.path.clone());
                 }
-                lr.set_expanded(!lr.is_expanded());
+                return;
             }
             if let Some(f) = t.cb.borrow().activate.as_ref() {
                 f(n);
             };
         });
-        // Single click on a folder toggles it, like VS Code.
-        let click = gtk::GestureClick::builder().button(1).build();
-        let w = Rc::downgrade(self);
-        click.connect_released(move |g, n_press, x, y| {
-            let Some(t) = w.upgrade() else { return };
-            let state = g.current_event_state();
-            if n_press != 1 || state.intersects(gdk::ModifierType::CONTROL_MASK | gdk::ModifierType::SHIFT_MASK) {
-                return;
-            }
-            let Some(pos) = t.pos_at(x, y) else { return };
-            if let Some(lr) = t.row_at(pos) {
-                if let Some(n) = node_of(lr.upcast_ref()) {
-                    if n.is_dir && n.trash.is_none() {
-                        // Ignore clicks on the expander arrow itself (it toggles already).
-                        if let Some(picked) = t.list.pick(x, y, gtk::PickFlags::DEFAULT) {
-                            if picked.ancestor(gtk::TreeExpander::static_type()).is_some()
-                                && (picked.css_name() == "expander" || picked.has_css_class("expander"))
-                            {
-                                return;
-                            }
-                        }
-                        lr.set_expanded(!lr.is_expanded());
-                    }
-                }
-            }
-        });
-        self.list.add_controller(click);
-        // Remember double-clicks (capture phase: before the row activates).
-        let dbl = gtk::GestureClick::builder().button(1).build();
-        dbl.set_propagation_phase(gtk::PropagationPhase::Capture);
-        let w = Rc::downgrade(self);
-        dbl.connect_pressed(move |_, n_press, _, _| {
-            if let Some(t) = w.upgrade() {
-                t.double_click.set(n_press == 2);
-            }
-        });
-        self.list.add_controller(dbl);
 
         let right = gtk::GestureClick::builder().button(3).build();
         let w = Rc::downgrade(self);
@@ -917,22 +1345,8 @@ impl Tree {
 
     /// List position under widget coordinates.
     fn pos_at(&self, x: f64, y: f64) -> Option<u32> {
-        let mut w = self.list.pick(x, y, gtk::PickFlags::DEFAULT)?;
-        loop {
-            if w.css_name() == "row" && w.parent().as_ref() == Some(self.list.upcast_ref()) {
-                break;
-            }
-            w = w.parent()?;
-        }
-        // Find the matching row by its child widget.
-        let child = w.first_child()?;
-        for r in self.rows.borrow().iter() {
-            if r.root.upcast_ref::<gtk::Widget>() == &child {
-                let lr = r.expander.list_row()?;
-                return Some(lr.position());
-            }
-        }
-        None
+        let w = self.list.pick(x, y, gtk::PickFlags::DEFAULT)?;
+        self.pos_of_widget(w)
     }
 
     pub fn row_at(&self, pos: u32) -> Option<gtk::TreeListRow> {
@@ -1025,33 +1439,25 @@ impl Tree {
     /// The focused row widget tells us the keyboard cursor position.
     fn focused_row_pos(&self) -> Option<u32> {
         let root = self.list.root()?;
-        let mut f = gtk::prelude::RootExt::focus(&root)?;
-        loop {
-            if f.parent().as_ref() == Some(self.list.upcast_ref()) {
-                let child = f.first_child()?;
-                for r in self.rows.borrow().iter() {
-                    if r.root.upcast_ref::<gtk::Widget>() == &child {
-                        return r.expander.list_row().map(|lr| lr.position());
-                    }
-                }
-                return None;
-            }
-            f = f.parent()?;
+        let f = gtk::prelude::RootExt::focus(&root)?;
+        if !f.is_ancestor(&self.list) {
+            return None;
         }
+        self.pos_of_widget(f)
     }
 
     pub fn select_pos(&self, pos: u32) {
         if pos >= self.selection.n_items() {
             return;
         }
-        self.list.scroll_to(pos, gtk::ListScrollFlags::FOCUS | gtk::ListScrollFlags::SELECT, None);
+        self.scroll_to(pos, gtk::ListScrollFlags::FOCUS | gtk::ListScrollFlags::SELECT);
     }
 
     pub fn focus(&self) {
         if let Some(p) = self.cursor_pos() {
-            self.list.scroll_to(p, gtk::ListScrollFlags::FOCUS, None);
+            self.scroll_to(p, gtk::ListScrollFlags::FOCUS);
         } else if self.selection.n_items() > 0 {
-            self.list.scroll_to(0, gtk::ListScrollFlags::FOCUS, None);
+            self.scroll_to(0, gtk::ListScrollFlags::FOCUS);
         }
         self.list.grab_focus();
     }
@@ -1077,7 +1483,7 @@ impl Tree {
             }
         }
         if let Some(p) = pos {
-            self.list.scroll_to(p, gtk::ListScrollFlags::FOCUS | gtk::ListScrollFlags::SELECT, None);
+            self.scroll_to(p, gtk::ListScrollFlags::FOCUS | gtk::ListScrollFlags::SELECT);
             return true;
         }
         false
@@ -1205,7 +1611,7 @@ impl Tree {
             let p = (cur + step * k).rem_euclid(n as i64) as u32;
             if let Some(nd) = self.row_at(p).and_then(|lr| node_of(lr.upcast_ref())) {
                 if fuzzy_contains(&nd.name, &q) {
-                    self.list.scroll_to(p, gtk::ListScrollFlags::SELECT, None);
+                    self.scroll_to(p, gtk::ListScrollFlags::SELECT);
                     return;
                 }
             }
@@ -1307,6 +1713,14 @@ impl Tree {
         });
         self.list.add_controller(drop);
     }
+}
+
+fn cell_pos(w: &gtk::Widget) -> Option<u32> {
+    // SAFETY: CELL_KEY is only ever set to a WeakRef<ListItem>.
+    let li = unsafe { w.data::<glib::WeakRef<gtk::ListItem>>(CELL_KEY) }?;
+    let li = unsafe { li.as_ref() }.upgrade()?;
+    let p = li.position();
+    (p != gtk::INVALID_LIST_POSITION).then_some(p)
 }
 
 pub fn fuzzy_contains(name: &str, q: &str) -> bool {

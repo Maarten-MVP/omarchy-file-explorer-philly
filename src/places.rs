@@ -200,7 +200,7 @@ pub struct PlacesPanel {
 
 impl PlacesPanel {
     pub fn new() -> Rc<PlacesPanel> {
-        let title = gtk::Label::builder().label("PLACES").xalign(0.0).hexpand(true).build();
+        let title = gtk::Label::builder().label("FAVORITES").xalign(0.0).hexpand(true).build();
         let pin = gtk::Button::builder()
             .icon_name("starred-symbolic")
             .tooltip_text("Pin or unpin this folder (Ctrl+Shift+D)")

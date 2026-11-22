@@ -335,7 +335,7 @@ window.philly headerbar button.flat:hover {{ color: {bright}; background: {hover
 .places-list .row-action {{ opacity: 0; min-height: 18px; min-width: 18px; padding: 0; }}
 .places-list row:hover .row-action {{ opacity: 1; }}
 .places-hint {{ font-size: 0.85em; padding: 10px 14px 14px 14px; }}
-.tree-sticky {{ background: {sidebar}; border-bottom: 1px solid {border}; box-shadow: 0 3px 6px -2px alpha(black, 0.45); }}
+.tree-sticky {{ background: {bg}; border-bottom: 1px solid {border}; box-shadow: 0 3px 6px -2px alpha(black, 0.45); }}
 .sticky-row {{ min-height: 22px; }}
 .sticky-row:hover {{ background: {hover}; }}
 .sticky-chevron {{ -gtk-icon-size: 12px; min-width: 14px; color: {dim}; }}
@@ -368,8 +368,9 @@ window.philly headerbar button.flat:hover {{ color: {bright}; background: {hover
 .preview-pane {{ background: {bg}; }}
 .sidebar-pane {{ background: {sidebar}; }}
 paned.main > separator {{ background: {border}; min-width: 1px; }}
-.activitybar {{ background: {darker}; border-left: 1px solid {border}; padding: 6px 0; }}
+.activitybar {{ background: {darker}; border-right: 1px solid {border}; padding: 6px 0; }}
 .activitybar button {{ min-width: 44px; min-height: 44px; padding: 0; border-radius: 0; color: {dim}; background: none; box-shadow: none; border-left: 2px solid transparent; }}
+.files-pane {{ background: {bg}; }}
 .activitybar button:hover {{ color: {bright}; }}
 .activitybar button:checked {{ color: {bright}; border-left-color: {accent}; }}
 .activitybar .badge {{ background: {accent}; color: {darker}; border-radius: 99px; font-size: 0.65em; font-weight: 700; min-width: 15px; min-height: 15px; padding: 0 3px; margin: 6px 4px; }}
@@ -386,6 +387,20 @@ listview.tree > row:hover, listview.flat > row:hover {{ background: {hover}; }}
 listview.tree > row:selected, listview.flat > row:selected {{ background: {sel_inactive}; color: {bright}; }}
 listview.tree:focus-within > row:selected, listview.flat:focus-within > row:selected {{ background: {sel}; box-shadow: inset 0 0 0 1px {accent}; }}
 listview.tree.drop-target {{ box-shadow: inset 0 0 0 2px {accent}; }}
+columnview.tree {{ background: {bg}; color: {fg}; }}
+columnview.tree > listview {{ background: {bg}; }}
+columnview.tree > listview > row {{ padding: 0; min-height: 24px; border-radius: 0; outline: none; }}
+columnview.tree > listview > row > cell {{ padding: 0 8px 0 0; }}
+columnview.tree > listview > row:hover {{ background: {hover}; }}
+columnview.tree > listview > row:selected {{ background: {sel_inactive}; color: {bright}; }}
+columnview.tree:focus-within > listview > row:selected {{ background: {sel}; box-shadow: inset 0 0 0 1px {accent}; }}
+columnview.tree.drop-target {{ box-shadow: inset 0 0 0 2px {accent}; }}
+columnview.tree > header {{ background: {bg}; border-bottom: 1px solid {border}; box-shadow: none; }}
+columnview.tree > header > button {{ padding: 3px 8px 3px 6px; background: none; box-shadow: none; border: none; border-radius: 0; color: {dim}; font-size: 0.85em; font-weight: 600; }}
+columnview.tree > header > button:hover {{ color: {bright}; background: {hover}; }}
+columnview.tree > header > button sort-indicator {{ color: {accent}; -gtk-icon-size: 10px; }}
+columnview.tree .cell-detail {{ color: {dim}; font-size: 0.9em; }}
+columnview.tree > listview > row:selected .cell-detail {{ color: {fg}; }}
 treeexpander {{ border-spacing: 0; }}
 treeexpander indent {{ -gtk-icon-size: 12px; min-width: 14px; }}
 treeexpander expander {{ min-width: 16px; color: {dim}; -gtk-icon-size: 12px; }}

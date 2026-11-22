@@ -72,6 +72,14 @@ pub fn human(n: u64) -> String {
     human_size(n)
 }
 
+pub fn items_label(n: usize) -> String {
+    if n == 1 {
+        "1 item".into()
+    } else {
+        format!("{n} items")
+    }
+}
+
 /// `column` keeps the key column of all rows as wide as the widest one, at any zoom.
 fn keycap_row(keys: &str, desc: &str, column: &gtk::SizeGroup) -> gtk::Box {
     let b = gtk::Box::new(gtk::Orientation::Horizontal, 10);

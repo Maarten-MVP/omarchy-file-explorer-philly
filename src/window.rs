@@ -7,7 +7,7 @@ use crate::pathbar::{self, PathBar};
 use crate::preview::Preview;
 use crate::search::{QuickOpen, SearchPanel};
 use crate::tree::{Node, Tree, TRASH_ROOT};
-use crate::{git, state};
+use crate::state;
 use adw::prelude::*;
 use gtk::{gdk, gio, glib};
 use std::cell::{Cell, RefCell};
@@ -120,13 +120,29 @@ pub struct Win {
     search: Rc<SearchPanel>,
     quick: Rc<QuickOpen>,
     side_stack: gtk::Stack,
-    btn_files: gtk::ToggleButton,
     btn_git: gtk::ToggleButton,
     btn_places: gtk::ToggleButton,
     places: Rc<crate::places::PlacesPanel>,
     btn_search: gtk::ToggleButton,
     git_badge: gtk::Label,
+    /// Sidebar | (files | preview).
     paned: gtk::Paned,
+    /// Files | preview.
+    inner: gtk::Paned,
+    /// The user wants the sidebar / preview shown (Ctrl+Alt+B / Ctrl+B);
+    /// they are still hidden while the window is too narrow.
+    want_side: Cell<bool>,
+    want_preview: Cell<bool>,
+    /// Widths to restore when the sidebar / preview come back.
+    side_w: Cell<i32>,
+    preview_w: Cell<i32>,
+    /// Width the layout was last fitted to.
+    fitted_w: Cell<i32>,
+    /// A mouse button is down in a paned (maybe dragging a divider).
+    dragging: Cell<bool>,
+    width_probe: gtk::DrawingArea,
+    side_btn: gtk::ToggleButton,
+    preview_btn: gtk::ToggleButton,
     status_branch: gtk::Label,
     status_sel: gtk::Label,
     shortcuts: gtk::Revealer,
@@ -134,11 +150,6 @@ pub struct Win {
     back: RefCell<Vec<PathBuf>>,
     forward: RefCell<Vec<PathBuf>>,
     current: RefCell<PathBuf>,
-    /// Root to use for the next navigate() instead of the automatic one.
-    force_root: RefCell<Option<PathBuf>>,
-    /// The current root was chosen by the user (double-click / Open as root):
-    /// keep it while navigating inside it.
-    root_sticky: Cell<bool>,
     preview_timer: RefCell<Option<glib::SourceId>>,
     picker: Option<Rc<PickerSpec>>,
     picker_name: Option<gtk::Entry>,
@@ -182,6 +193,9 @@ impl Win {
         let fwd_btn = gtk::Button::builder().icon_name("go-next-symbolic").tooltip_text("Forward (Alt+Right)").css_classes(["flat"]).build();
         let up_btn = gtk::Button::builder().icon_name("go-up-symbolic").tooltip_text("Parent folder (Alt+Up)").css_classes(["flat"]).build();
         let header = adw::HeaderBar::new();
+        let side_btn = gtk::ToggleButton::builder().icon_name("sidebar-show-symbolic").tooltip_text("Sidebar (Ctrl+Alt+B)").css_classes(["flat"]).active(true).build();
+        let preview_btn = gtk::ToggleButton::builder().icon_name("sidebar-show-right-symbolic").tooltip_text("Preview (Ctrl+B)").css_classes(["flat"]).active(true).build();
+        header.pack_start(&side_btn);
         header.pack_start(&back_btn);
         header.pack_start(&fwd_btn);
         header.pack_start(&up_btn);
@@ -193,6 +207,7 @@ impl Win {
         header.set_title_widget(Some(&title_box));
         let help_btn = gtk::Button::builder().icon_name("input-keyboard-symbolic").tooltip_text("Keyboard shortcuts (Ctrl+/)").css_classes(["flat"]).build();
         header.pack_end(&help_btn);
+        header.pack_end(&preview_btn);
         if picker.is_some() {
             header.set_show_end_title_buttons(false);
         }
@@ -205,6 +220,7 @@ impl Win {
         let quick = QuickOpen::new();
         preview.split.set(st.split);
         tree.show_hidden.set(st.show_hidden);
+        tree.set_sort(st.sort);
 
         let files_header = gtk::Box::new(gtk::Orientation::Horizontal, 0);
         files_header.add_css_class("section-header");
@@ -222,28 +238,27 @@ impl Win {
         files_header.append(&hb("view-refresh-symbolic", "Refresh (F5)", "win.refresh"));
         files_header.append(&hb("view-list-symbolic", "Collapse folders", "win.collapse"));
         let files_view = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        files_view.add_css_class("sidebar-pane");
+        files_view.add_css_class("files-pane");
         files_view.append(&files_header);
         files_view.append(&tree.widget);
 
+        // Left: favorites, search and source control. Middle: the files.
+        // Right: the preview.
         let side_stack = gtk::Stack::new();
         side_stack.set_transition_type(gtk::StackTransitionType::Crossfade);
         side_stack.set_transition_duration(80);
         side_stack.set_hexpand(true);
-        side_stack.add_named(&files_view, Some("files"));
-        side_stack.add_named(&git.widget, Some("git"));
-        side_stack.add_named(&search.widget, Some("search"));
         let places = crate::places::PlacesPanel::new();
         side_stack.add_named(&places.widget, Some("places"));
+        side_stack.add_named(&search.widget, Some("search"));
+        side_stack.add_named(&git.widget, Some("git"));
 
-        let btn_files = act_button("\u{f0c5}", "Explorer (Ctrl+Shift+E)");
+        let btn_places = act_button("\u{f005}", "Favorites & places (Ctrl+Shift+B)");
         let btn_search = act_button("\u{f002}", "Search (Ctrl+Shift+F)");
         let btn_git = act_button("\u{e725}", "Source control (Ctrl+Shift+G)");
-        btn_search.set_group(Some(&btn_files));
-        btn_git.set_group(Some(&btn_files));
-        let btn_places = act_button("\u{f005}", "Places & pinned folders (Ctrl+Shift+B)");
-        btn_places.set_group(Some(&btn_files));
-        btn_files.set_active(true);
+        btn_search.set_group(Some(&btn_places));
+        btn_git.set_group(Some(&btn_places));
+        btn_places.set_active(true);
         let git_badge = gtk::Label::new(None);
         git_badge.add_css_class("badge");
         git_badge.set_halign(gtk::Align::End);
@@ -255,36 +270,41 @@ impl Win {
         git_overlay.add_overlay(&git_badge);
         let activity = gtk::Box::new(gtk::Orientation::Vertical, 0);
         activity.add_css_class("activitybar");
-        activity.append(&btn_files);
         activity.append(&btn_places);
         activity.append(&btn_search);
         activity.append(&git_overlay);
 
-        let side = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-        side.add_css_class("sidebar-pane");
-        side.append(&side_stack);
-        side.append(&activity);
+        // The activity bar stays when the sidebar collapses.
+        side_stack.add_css_class("sidebar-pane");
+
+        let inner = gtk::Paned::new(gtk::Orientation::Horizontal);
+        inner.add_css_class("main");
+        inner.set_start_child(Some(&files_view));
+        inner.set_end_child(Some(&preview.widget));
+        inner.set_resize_start_child(true);
+        inner.set_resize_end_child(false);
+        inner.set_shrink_start_child(false);
+        inner.set_shrink_end_child(false);
+        files_view.set_size_request(320, -1);
+        preview.widget.set_size_request(260, -1);
 
         let paned = gtk::Paned::new(gtk::Orientation::Horizontal);
         paned.add_css_class("main");
-        paned.set_start_child(Some(&preview.widget));
-        paned.set_end_child(Some(&side));
-        paned.set_resize_start_child(true);
-        paned.set_resize_end_child(false);
+        paned.set_start_child(Some(&side_stack));
+        paned.set_end_child(Some(&inner));
+        paned.set_resize_start_child(false);
+        paned.set_resize_end_child(true);
         paned.set_shrink_start_child(false);
         paned.set_shrink_end_child(false);
-        preview.widget.set_size_request(260, -1);
-        side.set_size_request(260, -1);
-        // Restore the sidebar width (not the divider position): windows come in
-        // very different sizes when tiled, and the sidebar is the fixed part.
-        let side_w = st.side;
-        let applied = Rc::new(Cell::new(false));
-        paned.connect_notify_local(Some("max-position"), move |p, _| {
-            let total = p.width();
-            if total > 0 && !applied.replace(true) {
-                let side = side_w.clamp(240, (total as f64 * 0.6) as i32);
-                p.set_position(total - side);
-            }
+        side_stack.set_size_request(180, -1);
+        paned.set_hexpand(true);
+        let main_box = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        main_box.append(&activity);
+        main_box.append(&paned);
+        let t = tree.clone();
+        inner.connect_notify_local(Some("position"), move |p, _| {
+            let files = if p.end_child().map(|c| c.is_visible()).unwrap_or(false) { p.position() } else { p.width() };
+            t.fit_columns(files);
         });
 
         // ---------- shortcuts sheet ----------
@@ -297,7 +317,10 @@ impl Win {
         shortcuts.set_visible(false);
 
         let overlay = gtk::Overlay::new();
-        overlay.set_child(Some(&paned));
+        overlay.set_child(Some(&main_box));
+        // Reports the window's width (a paned's own signals don't fire on resize).
+        let width_probe = gtk::DrawingArea::builder().can_target(false).valign(gtk::Align::Start).height_request(0).build();
+        overlay.add_overlay(&width_probe);
         overlay.add_overlay(&quick.widget);
         overlay.add_overlay(&shortcuts);
         overlay.set_vexpand(true);
@@ -385,13 +408,22 @@ impl Win {
             search,
             quick,
             side_stack,
-            btn_files,
             btn_git,
             btn_places,
             places,
             btn_search,
             git_badge,
             paned,
+            inner,
+            want_side: Cell::new(st.show_sidebar),
+            want_preview: Cell::new(st.show_preview),
+            side_w: Cell::new(st.sidebar),
+            preview_w: Cell::new(st.preview),
+            fitted_w: Cell::new(0),
+            dragging: Cell::new(false),
+            width_probe,
+            side_btn,
+            preview_btn,
             status_branch,
             status_sel,
             shortcuts,
@@ -399,8 +431,6 @@ impl Win {
             back: RefCell::new(Vec::new()),
             forward: RefCell::new(Vec::new()),
             current: RefCell::new(PathBuf::new()),
-            force_root: RefCell::new(None),
-            root_sticky: Cell::new(false),
             preview_timer: RefCell::new(None),
             picker,
             picker_name,
@@ -422,6 +452,7 @@ impl Win {
         branch_click.connect_released(move |_, _, _, _| w.upgrade().map(|w| w.show_side("git")).unwrap_or(()));
 
         win.wire();
+        win.setup_layout();
         win.setup_actions();
         win.setup_keys();
         win.setup_picker();
@@ -573,7 +604,6 @@ impl Win {
         let w = self.weak();
         *self.quick.on_pick.borrow_mut() = Some(Box::new(move |p, alt| {
             if let Some(w) = w.upgrade() {
-                w.show_side("files");
                 w.navigate(&p, true);
                 w.tree.focus();
                 if alt {
@@ -588,7 +618,6 @@ impl Win {
             }
         }));
 
-        let w = self.weak();
         let w = self.weak();
         *self.preview.on_pick.borrow_mut() = Some(Box::new(move |p| {
             if let Some(w) = w.upgrade() {
@@ -614,11 +643,16 @@ impl Win {
         *self.places.on_pick.borrow_mut() = Some(Box::new(move |p| {
             if let Some(w) = w.upgrade() {
                 w.navigate(&p, true);
-                w.show_side("files");
+                w.tree.focus();
             }
         }));
+        *self.tree.on_sort_changed.borrow_mut() = Some(Box::new(|sort| {
+            let mut st = state::load();
+            st.sort = sort;
+            state::save(&st);
+        }));
 
-        for (btn, name) in [(&self.btn_files, "files"), (&self.btn_git, "git"), (&self.btn_search, "search"), (&self.btn_places, "places")] {
+        for (btn, name) in [(&self.btn_git, "git"), (&self.btn_search, "search"), (&self.btn_places, "places")] {
             let w = self.weak();
             btn.connect_toggled(move |b| {
                 if b.is_active() {
@@ -660,10 +694,10 @@ impl Win {
             let (w, h) = self.window.default_size();
             st.width = w;
             st.height = h;
-            let total = self.paned.width();
-            if total > 0 {
-                st.side = total - self.paned.position();
-            }
+            st.sidebar = self.side_w.get();
+            st.preview = self.preview_w.get();
+            st.show_sidebar = self.want_side.get();
+            st.show_preview = self.want_preview.get();
             st.split = self.preview.split.get();
             st.show_hidden = self.tree.show_hidden.get();
         } else {
@@ -690,13 +724,22 @@ impl Win {
         }
     }
 
+    /// Show a sidebar panel ("places", "search", "git"); "files" focuses the
+    /// file list.
     pub fn show_side(&self, name: &str) {
         let btn = match name {
             "git" => &self.btn_git,
             "search" => &self.btn_search,
             "places" => &self.btn_places,
-            _ => &self.btn_files,
+            _ => {
+                self.tree.focus();
+                return;
+            }
         };
+        if !self.side_stack.is_visible() {
+            self.want_side.set(true);
+            self.set_sidebar_shown(true);
+        }
         if btn.is_active() {
             self.on_side_changed(name);
         } else {
@@ -805,22 +848,14 @@ impl Win {
         let dir = if is_trash || target.is_dir() { target.clone() } else { target.parent().map(Path::to_path_buf).unwrap_or_else(|| target.clone()) };
         let is_dir = !is_trash && target.is_dir();
         let inside = !is_trash && !self.tree.is_trash() && root.as_os_str() != "" && dir.starts_with(&root);
-        // Opening a folder shows its contents: the tree is rooted at the folder
-        // (or at its git repo, with the folder expanded). Opening a file keeps
-        // the current tree when the file is inside it.
-        let forced = self.force_root.borrow_mut().take();
-        let sticky = self.root_sticky.get() && inside && forced.is_none();
-        self.root_sticky.set(forced.is_some() || sticky);
-        let new_root = if is_trash {
+        // Opening a folder lists its contents. Opening a file keeps the current
+        // list when the file is inside it, else lists the file's folder.
+        let new_root = if is_trash || is_dir {
             target.clone()
-        } else if let Some(r) = forced {
-            r
-        } else if sticky {
+        } else if inside {
             root.clone()
-        } else if is_dir || !inside {
-            self.root_for(&dir)
         } else {
-            root.clone()
+            dir.clone()
         };
         if new_root != root || is_trash != self.tree.is_trash() {
             self.tree.set_root(&new_root);
@@ -861,19 +896,6 @@ impl Win {
             pathbar::zoxide_add(&dir);
         }
         self.on_git_status();
-    }
-
-    /// Root folder for showing `dir`: its git repo root (VS Code style), unless
-    /// in picker mode or the repo is the whole home folder.
-    fn root_for(&self, dir: &Path) -> PathBuf {
-        if self.picker.is_some() {
-            return dir.to_path_buf();
-        }
-        let home = glib::home_dir();
-        match git::discover(dir) {
-            Some(r) if r != home && r != Path::new("/") => r,
-            _ => dir.to_path_buf(),
-        }
     }
 
     fn go_back(&self) {
@@ -1227,9 +1249,232 @@ impl Win {
         self.toast(&format!("Copied {}", if text.len() == 1 { text[0].clone() } else { plural(text.len(), "path") }));
     }
 
+    /// Keyboard focus is in the file list (or nowhere in particular).
+    fn files_focused(&self) -> bool {
+        match gtk::prelude::GtkWindowExt::focus(&self.window) {
+            Some(f) => f.is_ancestor(&self.tree.widget) || !self.focus_in_sidebar() && !f.is_ancestor(&self.preview.widget),
+            None => true,
+        }
+    }
+
+    fn focus_in_sidebar(&self) -> bool {
+        gtk::prelude::GtkWindowExt::focus(&self.window).map(|f| f.is_ancestor(&self.side_stack)).unwrap_or(false)
+    }
+
+    // ---------------------------------------------------------------- layout
+
+    /// Collapse the sidebar and hide the preview when the window gets too
+    /// narrow for them next to a usable file list, and bring them back when
+    /// it widens again.
+    fn setup_layout(self: &Rc<Self>) {
+        let w = self.weak();
+        self.width_probe.connect_resize(move |_, width, _| {
+            let Some(w) = w.upgrade() else { return };
+            if width <= 0 || width == w.fitted_w.get() {
+                return;
+            }
+            let first = w.fitted_w.replace(width) == 0;
+            // Not while GTK is allocating: showing and hiding panes resizes.
+            let w = w.weak();
+            glib::idle_add_local_once(move || {
+                if let Some(w) = w.upgrade() {
+                    w.fit_layout(first);
+                }
+            });
+        });
+        for p in [&self.paned, &self.inner] {
+            // A legacy controller sees presses and releases without taking
+            // part in gesture claiming (the divider's own drag claims).
+            let buttons = gtk::EventControllerLegacy::new();
+            buttons.set_propagation_phase(gtk::PropagationPhase::Capture);
+            let w = self.weak();
+            buttons.connect_event(move |_, ev| {
+                if let Some(w) = w.upgrade() {
+                    match ev.event_type() {
+                        gdk::EventType::ButtonPress => w.dragging.set(true),
+                        gdk::EventType::ButtonRelease => w.dragging.set(false),
+                        _ => {}
+                    }
+                }
+                glib::Propagation::Proceed
+            });
+            p.add_controller(buttons);
+            let w = self.weak();
+            p.connect_notify_local(Some("position"), move |_, _| {
+                if let Some(w) = w.upgrade() {
+                    if w.dragging.get() {
+                        w.remember_widths();
+                    }
+                }
+            });
+        }
+        // Header buttons show and hide the panes by hand.
+        let w = self.weak();
+        self.side_btn.connect_toggled(move |b| {
+            if let Some(w) = w.upgrade() {
+                if b.is_active() != w.side_stack.is_visible() {
+                    w.toggle_sidebar();
+                }
+            }
+        });
+        let w = self.weak();
+        self.preview_btn.connect_toggled(move |b| {
+            if let Some(w) = w.upgrade() {
+                if b.is_active() != w.preview.widget.is_visible() {
+                    w.toggle_preview();
+                }
+            }
+        });
+        // Clicking the active tab collapses or expands the sidebar; any tab
+        // expands it.
+        for btn in [&self.btn_places, &self.btn_search, &self.btn_git] {
+            let was_active = Rc::new(Cell::new(false));
+            let press = gtk::GestureClick::new();
+            press.set_propagation_phase(gtk::PropagationPhase::Capture);
+            let b = btn.clone();
+            let wa = was_active.clone();
+            press.connect_pressed(move |_, _, _, _| wa.set(b.is_active()));
+            btn.add_controller(press);
+            let w = self.weak();
+            // Runs after the toggle (the class handler runs first).
+            btn.connect_clicked(move |_| {
+                let Some(w) = w.upgrade() else { return };
+                if was_active.replace(false) || !w.side_stack.is_visible() {
+                    w.toggle_sidebar();
+                }
+            });
+        }
+    }
+
+    /// Widths (unzoomed px) the panes need to be shown.
+    fn needs(&self) -> (i32, i32, i32) {
+        let z = crate::theme::zoom();
+        let px = |v: f64| (v * z) as i32;
+        // files, sidebar, preview
+        (px(420.0), self.side_w.get().min(px(260.0)).max(px(180.0)), px(320.0))
+    }
+
+    fn fit_layout(&self, first: bool) {
+        let avail = self.paned.width();
+        if avail <= 0 {
+            self.fitted_w.set(0); // try again on the next resize
+            return;
+        }
+        let (files, side, prev) = self.needs();
+        let (ws, wp) = (self.want_side.get(), self.want_preview.get());
+        // The sidebar goes first, then the preview.
+        let (show_side, show_prev) = if ws && wp && avail >= files + side + prev {
+            (true, true)
+        } else if wp && avail >= files + prev {
+            (false, true)
+        } else if ws && !wp && avail >= files + side {
+            (true, false)
+        } else {
+            (false, false)
+        };
+        if first {
+            // Apply the saved widths once the panes have a size.
+            self.side_stack.set_visible(show_side);
+            self.side_btn.set_active(show_side);
+            if show_side {
+                self.paned.set_position(self.side_w.get());
+            }
+            self.preview.widget.set_visible(false);
+            self.set_preview_shown(show_prev);
+            self.preview_btn.set_active(show_prev);
+        } else {
+            self.set_sidebar_shown(show_side);
+            self.set_preview_shown(show_prev);
+        }
+    }
+
+    /// Note the pane widths after the user dragged a divider. Widths GTK or
+    /// the fitting squeezed are not remembered.
+    fn remember_widths(&self) {
+        if self.side_stack.is_visible() && self.paned.width() > 0 {
+            self.side_w.set(self.paned.position());
+        }
+        let total = self.inner.width();
+        if self.preview.widget.is_visible() && total > 0 {
+            self.preview_w.set(total - self.inner.position());
+        }
+    }
+
+    fn set_sidebar_shown(&self, show: bool) {
+        if self.side_stack.is_visible() == show {
+            return;
+        }
+        if !show && self.focus_in_sidebar() {
+            self.tree.focus();
+        }
+        self.side_stack.set_visible(show);
+        self.side_btn.set_active(show);
+        if show {
+            let (files, _, _) = self.needs();
+            let max = (self.paned.width() - files).max(180);
+            let pos = self.side_w.get().min(max);
+            self.paned.set_position(pos);
+
+        }
+        self.fit_columns_now();
+    }
+
+    fn set_preview_shown(&self, show: bool) {
+        if self.preview.widget.is_visible() == show {
+            return;
+        }
+        self.preview.widget.set_visible(show);
+        self.preview_btn.set_active(show);
+        if show {
+            self.place_preview();
+            // Again once the panes have their new size (the sidebar may have
+            // changed at the same time).
+            let w = self.weak();
+            glib::idle_add_local_once(move || {
+                if let Some(w) = w.upgrade() {
+                    w.place_preview();
+                }
+            });
+        }
+        self.fit_columns_now();
+    }
+
+    /// Give the preview its remembered width, leaving room for the files.
+    fn place_preview(&self) {
+        let total = if self.side_stack.is_visible() {
+            self.paned.width() - self.paned.position()
+        } else {
+            self.paned.width()
+        };
+        if total <= 0 {
+            return;
+        }
+        let (files, _, _) = self.needs();
+        let min = crate::theme::px(260);
+        let width = self.preview_w.get().min(total - files).max(min);
+        self.inner.set_position(total - width);
+
+    }
+
+    fn fit_columns_now(&self) {
+        let files = if self.preview.widget.is_visible() { self.inner.position() } else { self.inner.width() };
+        self.tree.fit_columns(files);
+    }
+
+    fn toggle_sidebar(&self) {
+        let show = !self.side_stack.is_visible();
+        self.want_side.set(show);
+        self.set_sidebar_shown(show);
+        if show {
+            let name = self.side_stack.visible_child_name().map(|n| n.to_string()).unwrap_or_default();
+            self.on_side_changed(&name);
+        }
+    }
+
     fn toggle_preview(&self) {
-        let v = !self.preview.widget.is_visible();
-        self.preview.widget.set_visible(v);
+        let show = !self.preview.widget.is_visible();
+        self.want_preview.set(show);
+        self.set_preview_shown(show);
     }
 
     /// Zoom the UI one step in (1) or out (-1), or back to 100% (0).
@@ -1266,9 +1511,8 @@ impl Win {
         }
     }
 
-    /// Make `dir` the tree root, also inside a git repo.
+    /// Open a folder in the file list.
     fn open_as_root(&self, dir: &Path) {
-        *self.force_root.borrow_mut() = Some(dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf()));
         self.navigate(dir, true);
         self.tree.focus();
     }
@@ -1311,7 +1555,7 @@ impl Win {
             let s1 = gio::Menu::new();
             if let Some(n) = &node {
                 if n.is_dir {
-                    item(&s1, "Open as root (double-click)", "win.open-root", None);
+                    item(&s1, "Open", "win.open-root", Some("Return"));
                     let label = if pathbar::is_bookmarked(&n.path) { "Unpin folder" } else { "Pin folder" };
                     item(&s1, label, "win.pin", Some("<Control><Shift>d"));
                 } else {
@@ -1531,7 +1775,10 @@ impl Win {
             }
         };
         add("<Control>p", Box::new(|w| {
-            w.quick.open(&w.tree.root());
+            // Go to file searches the whole git repo, not just this folder.
+            let home = glib::home_dir();
+            let scope = w.tree.repo_root().filter(|r| *r != home && r.as_path() != Path::new("/")).unwrap_or_else(|| w.tree.root());
+            w.quick.open(&scope);
             true
         }));
         add("<Control><Shift>f", Box::new(|w| {
@@ -1564,6 +1811,10 @@ impl Win {
         }));
         add("<Control><Shift>b", Box::new(|w| {
             w.show_side("places");
+            true
+        }));
+        add("<Control><Alt>b", Box::new(|w| {
+            w.toggle_sidebar();
             true
         }));
         add("<Control>b", Box::new(|w| {
@@ -1676,7 +1927,7 @@ impl Win {
             if w.pathbar.is_editing() {
                 return false;
             }
-            if w.picker.is_some() && !w.side_stack.visible_child_name().map(|n| n != "files").unwrap_or(false) {
+            if w.picker.is_some() && !w.focus_in_sidebar() {
                 gio::prelude::ActionGroupExt::activate_action(&w.window, "picker-cancel", None);
                 return true;
             }
@@ -1720,7 +1971,7 @@ impl Win {
             let ctrl = state.contains(gdk::ModifierType::CONTROL_MASK);
             let shift = state.contains(gdk::ModifierType::SHIFT_MASK);
             let alt = state.contains(gdk::ModifierType::ALT_MASK);
-            let in_files = w.side_stack.visible_child_name().as_deref() == Some("files");
+            let in_files = w.files_focused();
             let act = |name: &str| gio::prelude::ActionGroupExt::activate_action(&w.window, name, None);
             let handled = match (key, ctrl, shift, alt) {
                 (gdk::Key::c, true, false, false) if in_files => {
@@ -1958,21 +2209,21 @@ fn shortcuts_sheet() -> gtk::Widget {
                 ("Ctrl L", "Type a path / jump"),
                 ("Ctrl D", "Places, drives, trash"),
                 ("Ctrl Shift D", "Pin / unpin folder"),
-                ("Ctrl Shift B", "Places & pinned folders"),
-                ("Shift ⏎", "Folder as root (or double-click)"),
+                ("Ctrl Shift B", "Favorites & places"),
                 ("Alt ← / →", "Back / forward"),
                 ("Alt ↑  ⌫", "Parent folder"),
-                ("← / →", "Collapse / expand"),
-                ("type", "Find in tree"),
+                ("← / →", "Fold folder in / out"),
+                ("type", "Find in list"),
             ],
         ),
         (
             "PANELS",
             &[
-                ("Ctrl Shift E", "Explorer"),
+                ("Ctrl Shift E", "File list"),
                 ("Ctrl Shift F", "Search in files"),
                 ("Ctrl Shift G", "Source control"),
                 ("Ctrl B", "Toggle preview"),
+                ("Ctrl Alt B", "Toggle sidebar"),
                 ("Ctrl \\", "Diff side by side"),
                 ("Ctrl Shift V", "Markdown source"),
                 ("Ctrl H", "Hidden files"),
@@ -1983,7 +2234,7 @@ fn shortcuts_sheet() -> gtk::Widget {
         (
             "FILES",
             &[
-                ("Enter", "Open / toggle folder"),
+                ("Enter", "Open file / folder"),
                 ("Ctrl Enter", "Open in VS Code"),
                 ("Ctrl N", "New file"),
                 ("Ctrl Shift N", "New folder"),
